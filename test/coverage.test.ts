@@ -60,13 +60,36 @@ describe("openInBrowser", () => {
       execFile: (_file: string, _args: string[], _opts: unknown, cb: (err: Error | null) => void) =>
         cb(new Error("spawn open ENOENT")),
     }));
+    // Not in Docker, and — on Linux, where CI runs — not headless either.
+    // Without a display the opener short-circuits before it spawns anything,
+    // so this asserted nothing on Linux while passing on macOS.
     vi.doMock("node:fs", () => ({ existsSync: () => false }));
-    const { openInBrowser } = await import("#/compose/open");
-    const res = await openInBrowser("https://x.com/intent/tweet?text=hi");
-    expect(res.opened).toBe(false);
-    expect(res.reason).toMatch(/ENOENT/);
-    vi.doUnmock("node:child_process");
-    vi.doUnmock("node:fs");
+    vi.stubEnv("DISPLAY", ":0");
+    try {
+      const { openInBrowser } = await import("#/compose/open");
+      const res = await openInBrowser("https://x.com/intent/tweet?text=hi");
+      expect(res.opened).toBe(false);
+      expect(res.reason).toMatch(/ENOENT/);
+    } finally {
+      vi.unstubAllEnvs();
+      vi.doUnmock("node:child_process");
+      vi.doUnmock("node:fs");
+    }
+  });
+
+  it("reports a headless environment instead of trying to spawn a browser", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs", () => ({ existsSync: () => true })); // /.dockerenv
+    try {
+      const { openInBrowser } = await import("#/compose/open");
+      const res = await openInBrowser("https://x.com/intent/tweet?text=hi");
+      expect(res).toEqual({
+        opened: false,
+        reason: "headless environment — open the URL yourself",
+      });
+    } finally {
+      vi.doUnmock("node:fs");
+    }
   });
 
   it("refuses to open anything that is not X, whatever the model asked for", async () => {
