@@ -2,15 +2,16 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 
 import { UserContextRequiredError } from "#/client/errors";
-import { isRecord, shapePostsResponse } from "#/client/shape";
+import { isRecord } from "#/client/shape";
 import type { XApiClient } from "#/client/x";
 import type { ToolContext } from "#/tools/index";
 import {
+  assertWithinBudget,
   compact,
+  finishPostPage,
   maxResultsArg,
   paginationTokenArg,
   POST_QUERY,
-  recordResultCost,
   wrap,
 } from "#/tools/util";
 
@@ -70,7 +71,7 @@ export const registerTimelineTools = (
         "Requires `x-mcp login`; X only ever serves this for the authenticated account, so " +
         "there is no way to read someone else's. Billed at the cheaper owned-read rate.",
       inputSchema: z.object({
-        maxResults: maxResultsArg,
+        maxResults: maxResultsArg(ctx.defaultMaxResults),
         excludeReplies: z.boolean().default(false).describe("Leave out replies."),
         excludeReposts: z.boolean().default(false).describe("Leave out reposts (retweets)."),
         sinceId: z
@@ -85,6 +86,11 @@ export const registerTimelineTools = (
     async ({ maxResults, excludeReplies, excludeReposts, sinceId, paginationToken }) =>
       wrap(async () => {
         const userId = await resolveOwnUserId(client, ctx);
+        assertWithinBudget(
+          ctx,
+          "x_get_home_timeline",
+          ctx.ledger.estimateCount("owned", maxResults),
+        );
         const exclude = [
           ...(excludeReplies ? ["replies"] : []),
           ...(excludeReposts ? ["retweets"] : []),
@@ -100,17 +106,7 @@ export const registerTimelineTools = (
           }),
           { maxItems: maxResults, auth: "user" },
         );
-        const shaped = shapePostsResponse({ data: res.data, includes: res.includes[0] ?? {} });
-        return {
-          posts: shaped.posts,
-          result_count: shaped.posts.length,
-          ...(res.nextToken ? { next_token: res.nextToken } : {}),
-          cost: recordResultCost(
-            ctx,
-            "owned",
-            shaped.posts.map((p) => p.id),
-          ),
-        };
+        return finishPostPage(ctx, "owned", res);
       }),
   );
 
@@ -122,7 +118,7 @@ export const registerTimelineTools = (
         "Your saved bookmarks, newest first. Requires `x-mcp login` with the " +
         "`bookmark.read` scope — an app-only Bearer token cannot reach bookmarks at all.",
       inputSchema: z.object({
-        maxResults: maxResultsArg,
+        maxResults: maxResultsArg(ctx.defaultMaxResults),
         paginationToken: paginationTokenArg,
       }),
       annotations: { readOnlyHint: true },
@@ -130,6 +126,7 @@ export const registerTimelineTools = (
     async ({ maxResults, paginationToken }) =>
       wrap(async () => {
         const userId = await resolveOwnUserId(client, ctx);
+        assertWithinBudget(ctx, "x_get_bookmarks", ctx.ledger.estimateCount("owned", maxResults));
         const res = await client.paginate(
           `/2/users/${userId}/bookmarks`,
           compact({
@@ -139,17 +136,7 @@ export const registerTimelineTools = (
           }),
           { maxItems: maxResults, auth: "user" },
         );
-        const shaped = shapePostsResponse({ data: res.data, includes: res.includes[0] ?? {} });
-        return {
-          posts: shaped.posts,
-          result_count: shaped.posts.length,
-          ...(res.nextToken ? { next_token: res.nextToken } : {}),
-          cost: recordResultCost(
-            ctx,
-            "owned",
-            shaped.posts.map((p) => p.id),
-          ),
-        };
+        return finishPostPage(ctx, "owned", res);
       }),
   );
 };

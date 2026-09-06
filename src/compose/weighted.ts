@@ -30,14 +30,37 @@ export const MAX_WEIGHTED_LENGTH = 280;
 export const TCO_URL_LENGTH = 23;
 
 /**
- * Conservative URL detection. Scheme-ful URLs plus bare `domain.tld/path` for
- * the TLDs people actually paste. Deliberately narrow: over-matching would
- * silently under-count a draft (charging 23 for something X treats as plain
- * text), and a draft rejected at the composer is worse than one that looks a
- * few characters longer than it is.
+ * URL detection, transcribed from twitter-text's extractor rather than from a
+ * list of TLDs people paste. Three shapes count as a link:
+ *
+ *  - anything with an http(s) scheme;
+ *  - a bare domain ending in a generic TLD — three letters or more, which is
+ *    what makes `example.info` and `mit.edu` links;
+ *  - a bare domain ending in a two-letter country TLD **only when a path
+ *    follows** (`bit.ly/abc`, `example.fr/x`), plus `co` and `tv`, which
+ *    twitter-text special-cases because `t.co` and `twitch.tv` are ubiquitous.
+ *    A bare `node.js` or `example.fr` is therefore text, exactly as X treats it.
+ *
+ * The direction of the risk: a URL that is *missed* is under-counted (its
+ * real length instead of 23), so a draft this module calls valid is refused
+ * by X's composer at 280 — the failure this module exists to prevent. A false
+ * positive over-counts by a few characters and is merely conservative. So the
+ * matcher errs generous.
  */
-const URL_PATTERN =
-  /\bhttps?:\/\/[^\s<>"']+|\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:com|org|net|io|dev|co|ai|app|xyz|me|gg|so|sh|to|tv|fr|uk|de|jp)\b(?:\/[^\s<>"']*)?/gi;
+const DOMAIN = String.raw`(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+`;
+const PATH = String.raw`(?:\/[^\s<>"']*)?`;
+const URL_PATTERN = new RegExp(
+  [
+    String.raw`\bhttps?:\/\/[^\s<>"']+`,
+    // Generic TLD (3+ letters), path optional.
+    String.raw`\b${DOMAIN}[a-z]{3,24}\b${PATH}`,
+    // co / tv, path optional.
+    String.raw`\b${DOMAIN}(?:co|tv)\b${PATH}`,
+    // Any other two-letter TLD: only with a path.
+    String.raw`\b${DOMAIN}[a-z]{2}\b\/[^\s<>"']*`,
+  ].join("|"),
+  "gi",
+);
 
 const isLight = (codePoint: number): boolean =>
   LIGHT_RANGES.some(([start, end]) => codePoint >= start && codePoint <= end);

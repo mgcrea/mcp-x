@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 
 import type { AdsApiClient } from "#/client/ads";
+import { isRecord } from "#/client/ads-shape";
 import {
   accountIdArg,
   adsConfirmArg,
@@ -71,7 +72,7 @@ export const registerAdsTargetingTools = (
         );
         return {
           account_id: id,
-          targeting_criteria: page.data,
+          targeting_criteria: shapeAds({ data: page.data }),
           ...(page.nextCursor ? { next_cursor: page.nextCursor } : {}),
           cost: adsCostNote(),
         };
@@ -115,7 +116,17 @@ export const registerAdsTargetingTools = (
           .length(2)
           .optional()
           .describe('Two-letter country filter where the endpoint supports one, e.g. "FR".'),
-        count: adsCountArg,
+        count: z
+          .number()
+          .int()
+          .min(1)
+          .max(1000)
+          .default(50)
+          .describe(
+            "How many options to return (1-1000). Defaults to 50 rather than X's 200: a " +
+              "`locations` lookup is a full object per place, and the model only needs the one " +
+              "that matches `q`. Raise it when a filter is too broad to narrow.",
+          ),
       }),
       annotations: { readOnlyHint: true },
     },
@@ -135,7 +146,13 @@ export const registerAdsTargetingTools = (
         );
         return {
           type,
-          options: page.data,
+          // Option objects carry a null for every field their type does not
+          // use; dropping those halves a locations page without losing a value.
+          options: page.data.map((option) =>
+            isRecord(option)
+              ? Object.fromEntries(Object.entries(option).filter(([, v]) => v !== null))
+              : option,
+          ),
           ...(page.nextCursor ? { next_cursor: page.nextCursor } : {}),
           note:
             "Pass an option's `targeting_value` (or `id`) as targetingValue to " +

@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,12 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 import { staticTokenProvider } from "#/client/auth";
 import { effectiveScopes, loadConfig, type Config } from "#/config";
 import { createServer } from "#/server";
-
-const jsonResponse = (body: unknown, init: { status?: number } = {}) =>
-  new Response(JSON.stringify(body), {
-    status: init.status ?? 200,
-    headers: { "content-type": "application/json" },
-  });
+import { jsonResponse } from "#test/helpers";
 
 const ABSENT = "/nonexistent/config.json";
 
@@ -79,16 +74,16 @@ describe("with no credentials configured", () => {
   it("still connects, and serves the tools that need no credentials", async () => {
     const names = await (await connect({}, undefined, { realAuth: true })).toolNames();
     expect(names).toEqual([
-      "x_auth_status",
       "x_build_search_query",
       "x_compose_post",
+      "x_get_auth_status",
       "x_validate_post",
     ]);
   });
 
   it("does not register the tools that would call the X API", async () => {
     const names = await (await connect({}, undefined, { realAuth: true })).toolNames();
-    for (const tool of ["x_get_post", "x_search_recent", "x_get_user", "x_usage_report"]) {
+    for (const tool of ["x_get_post", "x_search_recent", "x_get_user", "x_get_usage_report"]) {
       expect(names).not.toContain(tool);
     }
   });
@@ -104,8 +99,8 @@ describe("with no credentials configured", () => {
     expect(h.fetchMock).not.toHaveBeenCalled();
   });
 
-  it("answers x_auth_status as a setup guide", async () => {
-    const res = await (await connect({}, undefined, { realAuth: true })).call("x_auth_status");
+  it("answers x_get_auth_status as a setup guide", async () => {
+    const res = await (await connect({}, undefined, { realAuth: true })).call("x_get_auth_status");
     expect(res.configured).toBe(false);
     expect(res.available_without_credentials).toContain("x_compose_post");
     const setup = (res.setup as string[]).join(" ");
@@ -115,27 +110,62 @@ describe("with no credentials configured", () => {
   });
 });
 
+/**
+ * The exact tool set per configuration. `toEqual`, never `toContain`: adding a
+ * tool has to show up as a diff here, so a tool leaking into a gated
+ * configuration is a failing test rather than a surprise in a client.
+ */
+const BEARER_TOOLS = [
+  "x_build_search_query",
+  "x_compose_post",
+  "x_count_recent",
+  "x_get_auth_status",
+  "x_get_post",
+  "x_get_posts",
+  "x_get_quotes",
+  "x_get_rate_limit_status",
+  "x_get_thread",
+  "x_get_usage_report",
+  "x_get_user",
+  "x_get_user_mentions",
+  "x_get_user_posts",
+  "x_get_users",
+  "x_request",
+  "x_search_recent",
+  "x_validate_post",
+];
+const USER_TOOLS = ["x_get_bookmarks", "x_get_home_timeline", "x_login", "x_logout"];
+const PAID_WRITE_TOOLS = ["x_create_post", "x_delete_post"];
+const exact = (...groups: string[][]): string[] => groups.flat().toSorted();
+
 describe("tool registration matrix", () => {
   it("registers the read and free-compose tools with only a bearer token", async () => {
     const names = await (await connect()).toolNames();
-    expect(names).toEqual([
-      "x_auth_status",
-      "x_build_search_query",
-      "x_compose_post",
-      "x_count_recent",
-      "x_get_post",
-      "x_get_posts",
-      "x_get_quotes",
-      "x_get_thread",
-      "x_get_user",
-      "x_get_user_mentions",
-      "x_get_user_posts",
-      "x_get_users",
-      "x_rate_limit_status",
-      "x_search_recent",
-      "x_usage_report",
-      "x_validate_post",
-    ]);
+    expect(names).toEqual(BEARER_TOOLS);
+  });
+
+  it("adds exactly the user-context tools once a client id is configured", async () => {
+    const names = await (await connect({ X_BEARER_TOKEN: "t", X_CLIENT_ID: "cid" })).toolNames();
+    expect(names).toEqual(exact(BEARER_TOOLS, USER_TOOLS));
+  });
+
+  it("adds exactly the paid write tools when both write flags are set", async () => {
+    const names = await (
+      await connect({
+        X_BEARER_TOKEN: "t",
+        X_CLIENT_ID: "cid",
+        X_ALLOW_WRITES: "1",
+        X_WRITE_BACKEND: "api",
+      })
+    ).toolNames();
+    expect(names).toEqual(exact(BEARER_TOOLS, USER_TOOLS, PAID_WRITE_TOOLS));
+  });
+
+  it("adds exactly x_search_all when full-archive access is enabled", async () => {
+    const names = await (
+      await connect({ X_BEARER_TOKEN: "t", X_ENABLE_FULL_ARCHIVE: "1" })
+    ).toolNames();
+    expect(names).toEqual(exact(BEARER_TOOLS, ["x_search_all"]));
   });
 
   it("does not register the paid write tools by default", async () => {
@@ -181,26 +211,16 @@ describe("tool registration matrix", () => {
 
   it("hides the login and user-context tools without an OAuth client id", async () => {
     const names = await (await connect()).toolNames();
-    for (const tool of [
-      "x_auth_login",
-      "x_auth_logout",
-      "x_get_bookmarks",
-      "x_get_home_timeline",
-    ]) {
+    for (const tool of ["x_login", "x_logout", "x_get_bookmarks", "x_get_home_timeline"]) {
       expect(names).not.toContain(tool);
     }
     // Status is always available, so you can find out *why* the rest are missing.
-    expect(names).toContain("x_auth_status");
+    expect(names).toContain("x_get_auth_status");
   });
 
   it("registers the login and user-context tools once a client id is configured", async () => {
     const names = await (await connect({ X_BEARER_TOKEN: "t", X_CLIENT_ID: "cid" })).toolNames();
-    for (const tool of [
-      "x_auth_login",
-      "x_auth_logout",
-      "x_get_bookmarks",
-      "x_get_home_timeline",
-    ]) {
+    for (const tool of ["x_login", "x_logout", "x_get_bookmarks", "x_get_home_timeline"]) {
       expect(names).toContain(tool);
     }
   });
@@ -355,7 +375,7 @@ describe("x_search_recent", () => {
     expect(decodeURIComponent(url)).toContain("tweet.fields=created_at");
   });
 
-  it("raises max_results to X's minimum of 10 while returning only what was asked", async () => {
+  it("raises max_results to X's minimum of 10 and returns and bills all ten", async () => {
     const h = await connect(
       undefined,
       vi.fn(async () =>
@@ -367,7 +387,40 @@ describe("x_search_recent", () => {
     );
     const res = await h.call("x_search_recent", { query: "rust", maxResults: 3 });
     expect(h.urls()[0]).toContain("max_results=10");
-    expect(res.posts).toHaveLength(3);
+    // X billed ten. Returning three and billing three would waste seven paid
+    // posts and under-report the spend by $0.035.
+    expect(res.posts).toHaveLength(10);
+    expect(res.result_count).toBe(10);
+    expect(res.cost).toMatchObject({ billable_post_reads: 10, estimated_usd: 0.05 });
+  });
+
+  it("resolves an author sideloaded only on a later page", async () => {
+    const h = await connect(
+      undefined,
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          jsonResponse({
+            data: Array.from({ length: 10 }, (_, i) => ({
+              id: String(i + 1),
+              text: `p${i}`,
+              author_id: "u1",
+            })),
+            includes: { users: [{ id: "u1", username: "first" }] },
+            meta: { result_count: 10, next_token: "page2" },
+          }),
+        )
+        .mockResolvedValueOnce(
+          jsonResponse({
+            data: [{ id: "11", text: "late", author_id: "u2" }],
+            includes: { users: [{ id: "u2", username: "second" }] },
+            meta: { result_count: 1 },
+          }),
+        ),
+    );
+    const res = await h.call("x_search_recent", { query: "rust", maxResults: 11 });
+    expect(res.posts).toHaveLength(11);
+    expect(res.posts[10].author).toBe("@second");
   });
 });
 
@@ -464,7 +517,7 @@ describe("x_compose_post", () => {
   });
 });
 
-describe("x_usage_report", () => {
+describe("x_get_usage_report", () => {
   it("accumulates spend across calls and labels itself an estimate", async () => {
     const h = await connect(
       undefined,
@@ -478,7 +531,7 @@ describe("x_usage_report", () => {
       ),
     );
     await h.call("x_get_posts", { postIds: ["1", "2"] });
-    const report = await h.call("x_usage_report");
+    const report = await h.call("x_get_usage_report");
 
     expect(report.since_process_start.billable_post_reads).toBe(2);
     expect(report.since_process_start.estimated_usd).toBe(0.01);
@@ -488,7 +541,7 @@ describe("x_usage_report", () => {
 
   it("reports budget headroom when one is configured", async () => {
     const h = await connect({ X_BEARER_TOKEN: "t", X_MONTHLY_BUDGET_USD: "1" });
-    const report = await h.call("x_usage_report");
+    const report = await h.call("x_get_usage_report");
     expect(report.budget).toEqual({ limit_usd: 1, remaining_usd: 1 });
   });
 });
@@ -504,22 +557,47 @@ describe("budget guard", () => {
   });
 });
 
-describe("x_rate_limit_status", () => {
+describe("x_get_rate_limit_status", () => {
   it("is empty before any request has been made", async () => {
-    const res = await (await connect()).call("x_rate_limit_status");
+    const res = await (await connect()).call("x_get_rate_limit_status");
     expect(res.endpoints).toEqual([]);
     expect(res.note).toMatch(/No requests issued yet/);
   });
 });
 
-describe("x_auth_status", () => {
+describe("x_get_auth_status", () => {
   it("reports a bearer-only install as able to read publicly but not bookmarks", async () => {
     const h = await connect({ X_BEARER_TOKEN: "t" }, undefined, { realAuth: true });
-    const res = await h.call("x_auth_status");
+    const res = await h.call("x_get_auth_status");
     expect(res.app_only_bearer).toBe(true);
     expect(res.user.authenticated).toBe(false);
     expect(res.can_read_public).toBe(true);
     expect(res.can_read_bookmarks).toBe(false);
+    // The one field a supervisor (Bastion) reads. Top level, boolean, always.
+    expect(res.signedIn).toBe(false);
+    expect(res.oauth).toBeUndefined();
+  });
+
+  it("tells an OAuth install which callback URL to register before logging in", async () => {
+    const h = await connect(
+      {
+        X_CLIENT_ID: "cid",
+        X_REDIRECT_URI: "http://127.0.0.1:8799/callback",
+        X_TOKEN_FILE: "/nonexistent/x-tokens.json",
+      },
+      undefined,
+      { realAuth: true },
+    );
+    const res = await h.call("x_get_auth_status");
+    expect(res.signedIn).toBe(false);
+    expect(res.oauth.redirect_uri).toBe("http://127.0.0.1:8799/callback");
+    expect(res.oauth.next_step).toContain("http://127.0.0.1:8799/callback");
+    expect(res.oauth.token_file.mode).toBe("absent");
+  });
+
+  it("answers the unconfigured state with signedIn false too", async () => {
+    const res = await (await connect({}, undefined, { realAuth: true })).call("x_get_auth_status");
+    expect(res.signedIn).toBe(false);
   });
 });
 
@@ -607,6 +685,31 @@ describe("resolving your own user id", () => {
     }
   });
 
+  // Bastion's Sign in / Sign out buttons call these three tools with no
+  // arguments and read `signedIn` from the status reply. That contract is
+  // what these two pin.
+  it("reports a staged session as signedIn, and x_logout with no arguments ends it", async () => {
+    const { dir, tokenFile } = stageSession({ userId: "44196397" });
+    try {
+      const h = await connect(env(tokenFile), vi.fn(), { realAuth: true });
+      const before = await h.call("x_get_auth_status");
+      expect(before.signedIn).toBe(true);
+      expect(before.user.username).toBe("mgcrea");
+
+      const out = await h.call("x_logout", {});
+      expect(out.isToolError).toBeFalsy();
+      expect(out).toMatchObject({ signedOut: true, signedIn: false });
+      expect(existsSync(tokenFile)).toBe(false);
+
+      const after = await h.call("x_get_auth_status");
+      expect(after.signedIn).toBe(false);
+      // Logging out twice is not an error; it just reports there was nothing.
+      expect((await h.call("x_logout", {})).signedOut).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("points at the enrollment trap when X will not identify the account", async () => {
     const { dir, tokenFile } = stageSession();
     try {
@@ -679,6 +782,21 @@ const ADS_SANDBOX = { ...ADS_WRITE, X_ADS_BASE_URL: "https://ads-api-sandbox.twi
 const adsNames = async (env: Record<string, string>): Promise<string[]> =>
   (await (await connect(env)).toolNames()).filter((n) => n.startsWith("x_ads_"));
 
+const ADS_READ_TOOLS = [
+  "x_ads_create_stats_job",
+  "x_ads_download_stats_job",
+  "x_ads_get_accounts",
+  "x_ads_get_audiences",
+  "x_ads_get_campaigns",
+  "x_ads_get_funding_instruments",
+  "x_ads_get_line_items",
+  "x_ads_get_promoted_tweets",
+  "x_ads_get_stats",
+  "x_ads_get_stats_jobs",
+  "x_ads_get_targeting_criteria",
+  "x_ads_search_targeting_options",
+];
+
 describe("ads tool registration", () => {
   // Cheap, and it keeps holding as ads tools are added later.
   it("registers no ads tools at all unless X_ADS_ENABLED is set", async () => {
@@ -687,36 +805,25 @@ describe("ads tool registration", () => {
   });
 
   it("registers the ads reads, and none of the writes, when only enabled", async () => {
-    expect(await adsNames(ADS_READ)).toEqual([
-      "x_ads_create_stats_job",
-      "x_ads_download_stats_job",
-      "x_ads_get_accounts",
-      "x_ads_get_audiences",
-      "x_ads_get_campaigns",
-      "x_ads_get_funding_instruments",
-      "x_ads_get_line_items",
-      "x_ads_get_promoted_tweets",
-      "x_ads_get_stats",
-      "x_ads_get_stats_jobs",
-      "x_ads_get_targeting_criteria",
-      "x_ads_search_targeting_options",
-    ]);
+    expect(await adsNames(ADS_READ)).toEqual(ADS_READ_TOOLS);
   });
 
-  it("registers the campaign-mutating tools only when X_ADS_ALLOW_WRITES is on", async () => {
-    const names = await adsNames(ADS_WRITE);
-    for (const tool of [
-      "x_ads_create_campaign",
-      "x_ads_update_campaign",
-      "x_ads_delete_campaign",
-      "x_ads_create_line_item",
-      "x_ads_delete_line_item",
-      "x_ads_create_targeting_criterion",
-      "x_ads_create_promoted_tweet",
-      "x_ads_set_entity_status",
-    ]) {
-      expect(names).toContain(tool);
-    }
+  it("registers exactly the campaign-mutating tools on top when X_ADS_ALLOW_WRITES is on", async () => {
+    expect(await adsNames(ADS_WRITE)).toEqual(
+      exact(ADS_READ_TOOLS, [
+        "x_ads_create_campaign",
+        "x_ads_create_line_item",
+        "x_ads_create_promoted_tweet",
+        "x_ads_create_targeting_criterion",
+        "x_ads_delete_campaign",
+        "x_ads_delete_line_item",
+        "x_ads_delete_promoted_tweet",
+        "x_ads_delete_targeting_criterion",
+        "x_ads_set_entity_status",
+        "x_ads_update_campaign",
+        "x_ads_update_line_item",
+      ]),
+    );
   });
 
   // Queuing an analytics job spends nothing, so gating it behind the money
@@ -727,23 +834,31 @@ describe("ads tool registration", () => {
     expect(names).toContain("x_ads_download_stats_job");
   });
 
-  it("registers the sandbox account tool only against the sandbox", async () => {
+  it("registers the sandbox account tool only against the sandbox, and only with writes", async () => {
     expect(await adsNames(ADS_WRITE)).not.toContain("x_ads_create_sandbox_account");
     expect(await adsNames(ADS_SANDBOX)).toContain("x_ads_create_sandbox_account");
-  });
-
-  it("refuses to start when ads is enabled without a user context", () => {
-    // A Bearer token cannot reach /12/accounts at all, so this is a
-    // configuration error rather than something to discover per call.
-    expect(() => loadConfig({ X_BEARER_TOKEN: "t", X_ADS_ENABLED: "1" }, ABSENT)).toThrow(
-      /X_CLIENT_ID/,
+    // It creates an entity, so a read-only sandbox profile does not get it.
+    expect(await adsNames({ ...ADS_READ, X_ADS_BASE_URL: ADS_SANDBOX.X_ADS_BASE_URL })).toEqual(
+      ADS_READ_TOOLS,
     );
   });
 
-  it("refuses ads writes that are switched on without ads itself", () => {
-    expect(() => loadConfig({ X_CLIENT_ID: "c", X_ADS_ALLOW_WRITES: "1" }, ABSENT)).toThrow(
-      /X_ADS_ENABLED/,
-    );
+  it("leaves ads unregistered, and says why, when it is enabled without a user context", async () => {
+    // A Bearer token cannot reach /12/accounts at all. Once this was a fatal
+    // config error; that reached the client as "Connection closed" with the
+    // explanation swallowed, so now the flag is switched off and the sentence
+    // travels with the config to the banner and the status tool.
+    const h = await connect({ X_BEARER_TOKEN: "t", X_ADS_ENABLED: "1" });
+    expect((await h.toolNames()).filter((n) => n.startsWith("x_ads_"))).toEqual([]);
+    const status = await h.call("x_get_auth_status");
+    expect(status.warnings).toEqual([expect.stringMatching(/X_CLIENT_ID/)]);
+  });
+
+  it("switches ads writes off, and says why, when ads itself is not enabled", async () => {
+    const h = await connect({ X_CLIENT_ID: "c", X_ADS_ALLOW_WRITES: "1" });
+    expect((await h.toolNames()).filter((n) => n.startsWith("x_ads_"))).toEqual([]);
+    const status = await h.call("x_get_auth_status");
+    expect(status.warnings).toEqual([expect.stringMatching(/X_ADS_ENABLED/)]);
   });
 
   it("asks for the ads scopes only when the matching tools exist", () => {
@@ -961,5 +1076,280 @@ describe("ads analytics guards", () => {
     });
     expect(res.isToolError).toBe(true);
     expect(res.error).toMatch(/placement/);
+  });
+});
+
+describe("x_request", () => {
+  const methodsOf = async (h: Harness): Promise<string[]> => {
+    const tool = (await h.client.listTools()).tools.find((t) => t.name === "x_request");
+    const schema = tool?.inputSchema as unknown as { properties: { method: { enum: string[] } } };
+    return schema.properties.method.enum;
+  };
+
+  it("is not registered without credentials", async () => {
+    const names = await (await connect({}, undefined, { realAuth: true })).toolNames();
+    expect(names).not.toContain("x_request");
+  });
+
+  it("offers only GET while every write gate is off, and says so in the schema", async () => {
+    const h = await connect();
+    expect(await methodsOf(h)).toEqual(["GET"]);
+    const tool = (await h.client.listTools()).tools.find((t) => t.name === "x_request");
+    expect(tool?.annotations).toMatchObject({ readOnlyHint: true, openWorldHint: true });
+  });
+
+  it("widens to the mutating methods once writes are enabled with a user context", async () => {
+    const h = await connect({ X_CLIENT_ID: "c", X_ALLOW_WRITES: "1", X_WRITE_BACKEND: "api" });
+    expect(await methodsOf(h)).toEqual(["GET", "POST", "PUT", "DELETE"]);
+  });
+
+  it("passes a v2 GET through raw, with the query joined the way X wants", async () => {
+    const h = await connect(
+      undefined,
+      vi.fn(async () => jsonResponse({ data: [{ id: "1", text: "raw" }], includes: {} })),
+    );
+    const res = await h.call("x_request", {
+      path: "/2/tweets",
+      query: { ids: ["1", "2"], "tweet.fields": ["created_at"] },
+    });
+    expect(res.isToolError).toBeFalsy();
+    expect(h.urls()[0]).toContain("/2/tweets?ids=1%2C2&tweet.fields=created_at");
+    // Raw: the envelope is X's, includes and all.
+    expect(res.response).toEqual({ data: [{ id: "1", text: "raw" }], includes: {} });
+    expect(res.cost.note).toMatch(/Not tracked/);
+  });
+
+  it("refuses a path outside the two API roots before sending anything", async () => {
+    const h = await connect();
+    for (const path of ["/1.1/statuses", "//evil.example/x", "/2/../oauth2/token", "tweets"]) {
+      const res = await h.call("x_request", { path });
+      expect(res.isToolError).toBe(true);
+    }
+    expect(h.fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses an Ads path when the Ads client is not configured", async () => {
+    const res = await (await connect()).call("x_request", { path: "/12/accounts" });
+    expect(res.isToolError).toBe(true);
+    expect(res.error).toMatch(/X_ADS_ENABLED/);
+  });
+
+  it("requires confirm on a mutation even when writes are enabled", async () => {
+    const h = await connect({ X_CLIENT_ID: "c", X_ALLOW_WRITES: "1", X_WRITE_BACKEND: "api" });
+    const refused = await h.call("x_request", { method: "DELETE", path: "/2/tweets/1" });
+    expect(refused.isToolError).toBe(true);
+    expect(refused.error).toMatch(/confirm/);
+    expect(h.fetchMock).not.toHaveBeenCalled();
+
+    const ok = await h.call("x_request", { method: "DELETE", path: "/2/tweets/1", confirm: true });
+    expect(ok.isToolError).toBeFalsy();
+    expect(h.fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * The three things a review cannot see and a client never reports: a tool
+ * with no service-prefixed title collides in the host's permission dialog, a
+ * tool with no annotations makes the host guess whether it is destructive, and
+ * an argument with no description makes the model guess what to pass. The
+ * resolved JSON Schema is read here, atoms included, which is why this lives in
+ * `test/` rather than in a source grep.
+ */
+describe("tool contract", () => {
+  const everything = {
+    X_BEARER_TOKEN: "t",
+    X_CLIENT_ID: "c",
+    X_ALLOW_WRITES: "1",
+    X_WRITE_BACKEND: "api",
+    X_ENABLE_FULL_ARCHIVE: "1",
+    X_ADS_ENABLED: "1",
+    X_ADS_ALLOW_WRITES: "1",
+    X_ADS_BASE_URL: "https://ads-api-sandbox.twitter.com",
+  };
+
+  it("registers the whole surface under the fullest configuration", async () => {
+    const names = await (await connect(everything)).toolNames();
+    expect(names.length).toBeGreaterThanOrEqual(48);
+  });
+
+  it("gives every tool a title prefixed with the service name", async () => {
+    const tools = (await (await connect(everything)).client.listTools()).tools;
+    for (const tool of tools) {
+      expect(tool.title, tool.name).toMatch(/^X: /);
+    }
+  });
+
+  it("gives every tool annotations, and a read-only verdict", async () => {
+    const tools = (await (await connect(everything)).client.listTools()).tools;
+    for (const tool of tools) {
+      expect(tool.annotations, tool.name).toBeDefined();
+      expect(typeof tool.annotations?.readOnlyHint, tool.name).toBe("boolean");
+    }
+  });
+
+  it("describes every input property, so the model never has to guess an argument", async () => {
+    const tools = (await (await connect(everything)).client.listTools()).tools;
+    const undescribed: string[] = [];
+    for (const tool of tools) {
+      const props = (tool.inputSchema as { properties?: Record<string, { description?: string }> })
+        .properties;
+      for (const [name, schema] of Object.entries(props ?? {})) {
+        if (!schema.description) undescribed.push(`${tool.name}.${name}`);
+      }
+    }
+    expect(undescribed).toEqual([]);
+  });
+});
+
+describe("x_validate_post", () => {
+  it("reports the weighted count without the intent URL, and never calls X", async () => {
+    const h = await connect({}, undefined, { realAuth: true });
+    const res = await h.call("x_validate_post", { text: "見て", url: "https://a.co" });
+    // 2 CJK characters at 2 each, a space, and a URL at 23.
+    expect(res).toMatchObject({ valid: true, weighted: 4 + 1 + 23, remaining: 280 - 28 });
+    expect(res.intent_url).toBeUndefined();
+    expect(res.warnings[0]).toMatch(/23 characters/);
+    expect(h.fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("counts a bare short-link domain as a URL, as X does", async () => {
+    const h = await connect({}, undefined, { realAuth: true });
+    const res = await h.call("x_validate_post", { text: `${"a".repeat(260)} bit.ly/abc` });
+    // 260 + space + 23 = 284: X would refuse this, so the draft must not pass.
+    expect(res.valid).toBe(false);
+    expect(res.weighted).toBe(284);
+  });
+});
+
+describe("x_create_post cost note", () => {
+  const writes = { X_CLIENT_ID: "c", X_ALLOW_WRITES: "1", X_WRITE_BACKEND: "api" };
+
+  it("bills the plain rate for a decimal number that is not a link", async () => {
+    const h = await connect(
+      writes,
+      vi.fn(async () => jsonResponse({ data: { id: "9" } })),
+    );
+    const res = await h.call("x_create_post", { text: "shipped v1.20, pi is 3.14", confirm: true });
+    expect(res.cost.estimated_usd).toBe(0.015);
+  });
+
+  it("bills the with-URL rate for a real link", async () => {
+    const h = await connect(
+      writes,
+      vi.fn(async () => jsonResponse({ data: { id: "9" } })),
+    );
+    const res = await h.call("x_create_post", { text: "read https://acme.dev/v2", confirm: true });
+    expect(res.cost.estimated_usd).toBe(0.2);
+  });
+});
+
+describe("ads analytics jobs", () => {
+  const ADS = {
+    X_BEARER_TOKEN: "t",
+    X_CLIENT_ID: "c",
+    X_ADS_ENABLED: "1",
+    X_ADS_ACCOUNT_ID: "acct1",
+  };
+
+  it("lists jobs, counts the finished ones, and pairs money fields with major units", async () => {
+    const h = await connect(
+      ADS,
+      vi.fn(async () =>
+        jsonResponse({
+          data: [
+            { id_str: "1", status: "SUCCESS", url: "https://ton.twimg.com/r/1.json.gz" },
+            { id_str: "2", status: "PROCESSING" },
+          ],
+        }),
+      ),
+    );
+    const res = await h.call("x_ads_get_stats_jobs", {});
+    expect(res.ready_count).toBe(1);
+    expect(res.jobs).toHaveLength(2);
+    expect(res.note).toBeUndefined();
+  });
+
+  it("summarises a downloaded job per entity and converts billed charges", async () => {
+    const { gzipSync } = await import("node:zlib");
+    const report = {
+      data: [
+        {
+          id: "camp1",
+          id_data: [
+            { metrics: { impressions: [10, 20], billed_charge_local_micro: [1_500_000, 500_000] } },
+            { metrics: { impressions: [5], billed_charge_local_micro: [250_000] } },
+          ],
+        },
+      ],
+    };
+    const h = await connect(
+      ADS,
+      vi.fn(
+        async () => new Response(gzipSync(Buffer.from(JSON.stringify(report))), { status: 200 }),
+      ),
+    );
+    const res = await h.call("x_ads_download_stats_job", {
+      url: "https://ton.twimg.com/advertiser-api-async-analytics/1.json.gz",
+    });
+    expect(res.entities).toEqual([
+      {
+        id: "camp1",
+        segments: 2,
+        totals: { impressions: 35, billed_charge_local_micro: 2_250_000, billed_charge: 2.25 },
+      },
+    ]);
+    expect(res.row_count).toBe(1);
+
+    const raw = await h.call("x_ads_download_stats_job", {
+      url: "https://ton.twimg.com/advertiser-api-async-analytics/1.json.gz",
+      raw: true,
+      maxRows: 1,
+    });
+    expect(raw.rows).toHaveLength(1);
+    expect(raw.truncated).toBe(false);
+  });
+
+  it("shapes the synchronous stats so BILLING spend is readable", async () => {
+    const h = await connect(
+      ADS,
+      vi.fn(async () =>
+        jsonResponse({
+          data: [
+            { id: "camp1", id_data: [{ metrics: { billed_charge_local_micro: [47_500_000] } }] },
+          ],
+        }),
+      ),
+    );
+    const res = await h.call("x_ads_get_stats", {
+      entity: "CAMPAIGN",
+      entityIds: ["camp1"],
+      startTime: "2026-08-01T00:00:00Z",
+      endTime: "2026-08-02T00:00:00Z",
+      metricGroups: ["BILLING"],
+    });
+    // Metrics are one value per time bucket, so the paired field is a series too.
+    expect(res.stats[0].id_data[0].metrics).toMatchObject({
+      billed_charge_local_micro: [47_500_000],
+      billed_charge: [47.5],
+    });
+  });
+
+  it("pairs credit limits on funding instruments, not only *_amount_* fields", async () => {
+    const h = await connect(
+      ADS,
+      vi.fn(async () =>
+        jsonResponse({
+          data: [
+            {
+              id: "fi1",
+              credit_limit_local_micro: 10_000_000,
+              credit_remaining_local_micro: 2_500_000,
+            },
+          ],
+        }),
+      ),
+    );
+    const res = await h.call("x_ads_get_funding_instruments", {});
+    expect(res.funding_instruments[0]).toMatchObject({ credit_limit: 10, credit_remaining: 2.5 });
   });
 });

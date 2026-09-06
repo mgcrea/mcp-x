@@ -49,11 +49,15 @@ export const registerComposeTools = (
         hashtags: hashtagsArg,
         via: viaArg,
       }),
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async ({ text, url, hashtags, via }) =>
       wrap(async () => {
-        const { intent_url: _intentUrl, ...validation } = validateIntent({
+        const {
+          intent_url: _intentUrl,
+          urls: _urls,
+          ...validation
+        } = validateIntent({
           text,
           url,
           hashtags,
@@ -93,7 +97,7 @@ export const registerComposeTools = (
       // Not readOnly (it may open a browser), but deliberately NOT gated behind
       // allowWrites: it changes nothing without a human click, and gating the
       // free path would push people toward the paid one.
-      annotations: { readOnlyHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
     async ({ text, url, hashtags, via, inReplyTo, open }) =>
       wrap(async () => {
@@ -172,7 +176,10 @@ export const registerComposeTools = (
           }),
         );
 
-        const hasUrl = validation.weighted !== undefined && /https?:\/\/|\w+\.\w{2,}/.test(text);
+        // Same detector the character count uses, so the cost note and the
+        // 280 check agree on what a link is. A looser regex here once billed
+        // "shipped v1.20" at the with-URL rate — thirteen times the real price.
+        const hasUrl = validation.urls.length > 0;
         ctx.ledger.recordCreate(hasUrl);
 
         const data = isRecord(res) && isRecord(res.data) ? res.data : {};

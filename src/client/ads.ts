@@ -1,10 +1,13 @@
-import { gunzipSync } from "node:zlib";
+import { promisify } from "node:util";
+import { gunzip as gunzipCallback } from "node:zlib";
 
 import type { Logger, TokenProvider } from "#/client/auth";
 import { PreconditionError, type XApiError, XApiRequestError } from "#/client/errors";
 import {
   buildQuery,
+  DEFAULT_REQUEST_TIMEOUT_MS,
   endpointKey,
+  fetchWithTimeout,
   numberOrUndefined,
   safeJsonParse,
   withRetry,
@@ -12,6 +15,11 @@ import {
   type RateLimitSnapshot,
 } from "#/client/http";
 import { DEFAULT_ADS_BASE_URL } from "#/config";
+
+const gunzip = promisify(gunzipCallback);
+
+/** A result file can be large; give it four times the per-request deadline. */
+const DOWNLOAD_TIMEOUT_MS = 4 * DEFAULT_REQUEST_TIMEOUT_MS;
 
 export type AdsApiClientOptions = {
   baseUrl?: string;
@@ -22,6 +30,7 @@ export type AdsApiClientOptions = {
   tokenProvider: TokenProvider;
   maxRetries?: number;
   maxDownloadBytes?: number;
+  requestTimeoutMs?: number;
   fetch?: typeof fetch;
   logger?: Logger;
   userAgent?: string;
@@ -31,7 +40,6 @@ export type CursorPage<T> = {
   data: T[];
   pages: number;
   nextCursor?: string;
-  totalCount?: number;
 };
 
 /** The default page size X uses. Its maximum is 1000. */
@@ -41,9 +49,12 @@ const DEFAULT_COUNT = 200;
  * Hosts the async-analytics download is allowed to reach. The URL comes out of
  * an X response rather than from us, and following a server-supplied URL
  * unchecked is an SSRF primitive — not something to leave open in a project
- * whose pitch is a small attack surface.
+ * whose pitch is a small attack surface. X serves these from `ton.twimg.com`;
+ * `.amazonaws.com` used to be listed "just in case", which allowed every S3
+ * bucket in the world, so it is not. Add a host here only once a real download
+ * has been observed on it.
  */
-const DOWNLOAD_HOSTS = [".x.com", ".twimg.com", ".twitter.com", ".amazonaws.com"];
+const DOWNLOAD_HOSTS = [".x.com", ".twimg.com", ".twitter.com"];
 
 /**
  * `endpointKey` collapses long digit runs, which is right for v2 post ids and
@@ -79,6 +90,7 @@ export class AdsApiClient {
   private readonly tokenProvider: TokenProvider;
   private readonly maxRetries: number;
   private readonly maxDownloadBytes: number;
+  private readonly requestTimeoutMs: number;
   private readonly fetchImpl: typeof fetch;
   private readonly logger: Logger | undefined;
   private readonly userAgent: string;
@@ -90,6 +102,7 @@ export class AdsApiClient {
     this.tokenProvider = opts.tokenProvider;
     this.maxRetries = opts.maxRetries ?? 3;
     this.maxDownloadBytes = opts.maxDownloadBytes ?? 25_000_000;
+    this.requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.fetchImpl = opts.fetch ?? fetch;
     this.logger = opts.logger;
     this.userAgent = opts.userAgent ?? "mcp-x-js";
@@ -133,14 +146,20 @@ export class AdsApiClient {
     const res = await withRetry(
       async () => {
         const token = await this.tokenProvider.getToken("user");
-        return this.fetchImpl(url, {
-          method,
-          headers: {
-            Accept: "application/json",
-            Authorization: `Bearer ${token}`,
-            "User-Agent": this.userAgent,
+        return fetchWithTimeout(
+          this.fetchImpl,
+          url,
+          {
+            method,
+            headers: {
+              Accept: "application/json",
+              Authorization: `Bearer ${token}`,
+              "User-Agent": this.userAgent,
+            },
           },
-        });
+          this.requestTimeoutMs,
+          `X Ads API ${method} ${path}`,
+        );
       },
       {
         maxRetries: this.maxRetries,
@@ -188,20 +207,24 @@ export class AdsApiClient {
    * it is `null` (not absent) on the last page, and it goes back out as
    * `cursor`. Everything else about the loop matches `XApiClient.paginate`,
    * which is why this is a separate method rather than a shared one — the
-   * differences are exactly the parts that matter.
+   * differences are exactly the parts that matter. As there, `maxItems` stops
+   * the fetching and never trims the result: a trimmed page plus the cursor of
+   * the page after it is a cursor that skips records.
    */
   async paginateCursor<T = unknown>(
     path: string,
     query: Query,
     opts: { maxItems: number; maxPages?: number },
   ): Promise<CursorPage<T>> {
-    type Envelope = { data?: T[]; next_cursor?: unknown; total_count?: unknown };
+    // `total_count` exists in the envelope but only when a request asks for
+    // `with_total_count`, which nothing here does — X halves the rate limit for
+    // it. So it is not collected rather than collected and always undefined.
+    type Envelope = { data?: T[]; next_cursor?: unknown };
     const maxPages = opts.maxPages ?? 5;
     const collected: T[] = [];
     let cursor: string | undefined;
     let pages = 0;
     let nextCursor: string | undefined;
-    let totalCount: number | undefined;
 
     for (;;) {
       const res: Envelope = await this.request<Envelope>("GET", path, {
@@ -211,7 +234,6 @@ export class AdsApiClient {
       });
       pages += 1;
       if (Array.isArray(res?.data)) collected.push(...res.data);
-      if (typeof res?.total_count === "number") totalCount = res.total_count;
 
       const next = res?.next_cursor;
       cursor = typeof next === "string" && next ? next : undefined;
@@ -221,10 +243,9 @@ export class AdsApiClient {
     }
 
     return {
-      data: collected.slice(0, opts.maxItems),
+      data: collected,
       pages,
       ...(nextCursor ? { nextCursor } : {}),
-      ...(totalCount !== undefined ? { totalCount } : {}),
     };
   }
 
@@ -237,7 +258,9 @@ export class AdsApiClient {
    * because the URL came from a remote response. And both the compressed and
    * decompressed sizes are capped: a 25 MB gzip of repetitive JSON expands to
    * hundreds of megabytes, so an uncapped gunzip here is an OOM waiting for a
-   * big enough report.
+   * big enough report. The body is read as a stream and abandoned the moment it
+   * crosses the cap, so a chunked response with no `content-length` cannot
+   * defeat the check by arriving whole before it is measured.
    */
   async downloadGzipped(url: string): Promise<{ text: string; bytes: number }> {
     let parsed: URL;
@@ -255,9 +278,13 @@ export class AdsApiClient {
       );
     }
 
-    const res = await this.fetchImpl(url, {
-      headers: { Accept: "application/json", "User-Agent": this.userAgent },
-    });
+    const res = await fetchWithTimeout(
+      this.fetchImpl,
+      url,
+      { headers: { Accept: "application/json", "User-Agent": this.userAgent } },
+      DOWNLOAD_TIMEOUT_MS,
+      "The analytics result download",
+    );
     if (!res.ok) {
       throw new XApiRequestError(
         `Downloading the analytics result failed: HTTP ${res.status} ${res.statusText}. These ` +
@@ -276,17 +303,15 @@ export class AdsApiClient {
       );
     }
 
-    const buf = Buffer.from(await res.arrayBuffer());
-    if (buf.byteLength > this.maxDownloadBytes) {
-      throw new PreconditionError(
-        `The analytics result is ${buf.byteLength} bytes, over the ${this.maxDownloadBytes}-byte ` +
-          `limit. Narrow the job, or raise X_ADS_MAX_DOWNLOAD_BYTES.`,
-        { bytes: buf.byteLength, limit: this.maxDownloadBytes },
-      );
-    }
+    const buf = await this.readCapped(res);
+
+    // Small results are sometimes served uncompressed despite the `.gz` name;
+    // gunzipping those throws a zlib error that says nothing useful.
+    const isGzip = buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b;
+    if (!isGzip) return { text: buf.toString("utf8"), bytes: buf.byteLength };
 
     try {
-      const out = gunzipSync(buf, { maxOutputLength: this.maxDownloadBytes * 20 });
+      const out = await gunzip(buf, { maxOutputLength: this.maxDownloadBytes * 20 });
       return { text: out.toString("utf8"), bytes: out.byteLength };
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ERR_BUFFER_TOO_LARGE") {
@@ -298,6 +323,37 @@ export class AdsApiClient {
       }
       throw err;
     }
+  }
+
+  /** Read a body up to the cap, cancelling the stream the moment it is crossed. */
+  private async readCapped(res: Response): Promise<Buffer> {
+    const tooLarge = (bytes: number): PreconditionError =>
+      new PreconditionError(
+        `The analytics result is over ${this.maxDownloadBytes} bytes (${bytes} read before ` +
+          `stopping). Narrow the job, or raise X_ADS_MAX_DOWNLOAD_BYTES.`,
+        { bytes, limit: this.maxDownloadBytes },
+      );
+
+    if (!res.body) {
+      const whole = Buffer.from(await res.arrayBuffer());
+      if (whole.byteLength > this.maxDownloadBytes) throw tooLarge(whole.byteLength);
+      return whole;
+    }
+
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let received = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      if (received > this.maxDownloadBytes) {
+        await reader.cancel().catch(() => {});
+        throw tooLarge(received);
+      }
+      chunks.push(value);
+    }
+    return Buffer.concat(chunks);
   }
 
   private parseErrors(text: string): XApiError[] | unknown {

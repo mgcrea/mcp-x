@@ -54,7 +54,7 @@ export const createServer = (opts: CreateServerOptions): CreatedServer => {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 
   const scopes = effectiveScopes(config);
-  const store = createTokenStore(config.tokenFile);
+  const store = createTokenStore(config.tokenFile, opts.logger);
 
   const tokenProvider =
     opts.tokenProvider ??
@@ -120,6 +120,8 @@ export const createServer = (opts: CreateServerOptions): CreatedServer => {
     ledger,
     tokenProvider,
     hasCredentials: hasApiCredentials(config),
+    warnings: config.warnings,
+    redirectUri: config.redirectUri,
     ...(hasApiCredentials(config) ? {} : { setup: setupInstructions(config) }),
     ...(ads
       ? {

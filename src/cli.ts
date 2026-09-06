@@ -5,7 +5,13 @@ import { ZodError } from "zod";
 import { BUILD_INFO } from "#/build-info";
 import { startLoginFlow } from "#/client/oauth";
 import { openInBrowser } from "#/compose/open";
-import { hasAdsAccess, hasApiCredentials, loadConfig, setupInstructions } from "#/config";
+import {
+  hasAdsAccess,
+  hasApiCredentials,
+  loadConfig,
+  resolveConfigPath,
+  setupInstructions,
+} from "#/config";
 import { createServer } from "#/server";
 
 // Everything goes to stderr: stdout is the MCP protocol channel, and a stray
@@ -44,7 +50,8 @@ const describeAuth = (config: ReturnType<typeof loadConfig>): string => {
 const runSubcommand = async (command: string): Promise<boolean> => {
   if (!["login", "logout", "status"].includes(command)) return false;
 
-  const config = loadConfig();
+  const config = loadConfig(process.env, resolveConfigPath(), stderrLogger);
+  for (const line of config.warnings) stderrLogger.warn(line);
   const { store, tokenProvider } = createServer({ config, logger: stderrLogger });
 
   if (command === "status") {
@@ -80,7 +87,9 @@ const runSubcommand = async (command: string): Promise<boolean> => {
   const { tokens } = await startLoginFlow({
     config,
     store,
-    openBrowser: openInBrowser,
+    // Honour X_AUTO_OPEN_BROWSER here too: on a headless box the printed URL
+    // is the whole flow, and an xdg-open attempt is only noise.
+    ...(config.autoOpenBrowser ? { openBrowser: openInBrowser } : {}),
     logger: stderrLogger,
   });
   console.error(
@@ -98,10 +107,14 @@ const main = async (): Promise<void> => {
   const command = process.argv[2];
   if (command && (await runSubcommand(command))) return;
 
-  const config = loadConfig();
+  const config = loadConfig(process.env, resolveConfigPath(), stderrLogger);
   const { server } = createServer({ config, logger: stderrLogger });
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  // A flag that was switched off is worth one line each, right under the
+  // banner that shows it off — the server no longer exits over these.
+  for (const line of config.warnings) stderrLogger.warn(`config: ${line}`);
 
   stderrLogger.warn(
     `x-mcp connected (auth=${describeAuth(config)}, ` +
@@ -114,10 +127,10 @@ const main = async (): Promise<void> => {
 
   // Connecting successfully but exposing only four tools is confusing unless we
   // say why. The server no longer refuses to start over this, so the banner and
-  // x_auth_status are the only channels left.
+  // x_get_auth_status are the only channels left.
   if (!hasApiCredentials(config)) {
     for (const line of setupInstructions(config)) stderrLogger.warn(line);
-    stderrLogger.warn("Call the x_auth_status tool for this same guidance inside your client.");
+    stderrLogger.warn("Call the x_get_auth_status tool for this same guidance inside your client.");
   }
 
   const shutdown = (signal: string): void => {

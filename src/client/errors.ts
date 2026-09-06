@@ -49,19 +49,6 @@ export class UserContextRequiredError extends Error {
   }
 }
 
-/** Thrown when a write tool is reached while X_ALLOW_WRITES is off. */
-export class WritesDisabledError extends Error {
-  override readonly name = "WritesDisabledError";
-
-  constructor(what: string) {
-    super(
-      `${what} is a write operation, but writes are disabled. Set X_ALLOW_WRITES=1 to enable ` +
-        `mutating tools. Note that x_compose_post posts for free via a web intent and needs no ` +
-        `flag at all.`,
-    );
-  }
-}
-
 /**
  * Thrown when the Ads API is reachable but this account cannot use it — no Ads
  * entitlement on the app, or no ads account behind the logged-in user. Separate
@@ -108,5 +95,23 @@ export class PreconditionError extends Error {
   constructor(message: string, details: Record<string, unknown> = {}) {
     super(message);
     this.details = details;
+  }
+}
+
+/**
+ * The upstream did not answer within the client's deadline. Separate from
+ * `XApiRequestError` because there is no status to quote and no envelope to
+ * parse — the fix is to retry later, or to narrow the request.
+ */
+export class RequestTimeoutError extends Error {
+  override readonly name = "RequestTimeoutError";
+  readonly timeoutMs: number;
+
+  constructor(label: string, timeoutMs: number) {
+    super(
+      `${label} did not answer within ${Math.round(timeoutMs / 1000)}s. X may be slow or ` +
+        `unreachable; retry in a moment, or ask for fewer results.`,
+    );
+    this.timeoutMs = timeoutMs;
   }
 }

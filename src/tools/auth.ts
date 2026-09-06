@@ -5,24 +5,33 @@ import { fileMode } from "#/client/tokens";
 import type { ToolContext } from "#/tools/index";
 import { wrap } from "#/tools/util";
 
+/**
+ * The auth tools double as the "Authenticate button" for supervisors that
+ * have one. Bastion drives a child server's login through exactly three tools
+ * it calls with no arguments — status, login, logout — and reads one field
+ * from the status reply: a top-level boolean `signedIn`. Everything else here
+ * is for a human or a model. Keep those three shapes stable.
+ */
 export const registerAuthTools = (server: McpServer, ctx: ToolContext): void => {
   server.registerTool(
-    "x_auth_status",
+    "x_get_auth_status",
     {
-      title: "X: Auth Status",
+      title: "X: Get Auth Status",
       description:
         "Which credentials this server is holding: an app-only Bearer token (enough for public " +
-        "reads and search), an OAuth2 user session (needed for bookmarks and the home timeline), " +
-        "or neither. Shows the logged-in handle, granted scopes and token expiry, and whether " +
-        "the Ads API tools are registered and against which environment. Call this first if the " +
-        "X API tools seem to be missing — it explains exactly what to configure.",
+        "reads and search), an OAuth2 user session (needed for bookmarks, the home timeline, " +
+        "API writes and Ads), or neither. Shows the logged-in handle, granted scopes, token " +
+        "expiry, the callback URL a login expects, whether the Ads API tools are registered and " +
+        "against which environment, and any setting that was switched off at startup. Call this " +
+        "first if the X API tools seem to be missing — it explains exactly what to configure.",
       inputSchema: z.object({}),
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async () =>
       wrap(async () => {
         const status = ctx.tokenProvider.describe();
         const mode = ctx.tokenFile ? fileMode(ctx.tokenFile) : undefined;
+        const warnings = ctx.warnings.length > 0 ? { warnings: ctx.warnings } : {};
 
         // The state a first-time user lands in. Answer it as a setup guide
         // rather than a status dump, since the server can no longer signal this
@@ -30,6 +39,7 @@ export const registerAuthTools = (server: McpServer, ctx: ToolContext): void => 
         if (!ctx.hasCredentials) {
           return {
             configured: false,
+            signedIn: false,
             app_only_bearer: false,
             user: { authenticated: false, reason: "no credentials configured" },
             can_read_public: false,
@@ -38,14 +48,18 @@ export const registerAuthTools = (server: McpServer, ctx: ToolContext): void => 
               "x_compose_post",
               "x_validate_post",
               "x_build_search_query",
-              "x_auth_status",
+              "x_get_auth_status",
             ],
             setup: ctx.setup ?? [],
+            ...warnings,
           };
         }
 
         return {
           configured: true,
+          // The one field a supervisor reads. Everything else is prose for a
+          // person or a model; this is the contract.
+          signedIn: status.user.authenticated,
           app_only_bearer: status.app,
           user: status.user.authenticated
             ? {
@@ -57,14 +71,32 @@ export const registerAuthTools = (server: McpServer, ctx: ToolContext): void => 
                 ),
               }
             : status.user,
-          ...(ctx.tokenFile
+          ...(ctx.login
             ? {
-                token_file: {
-                  path: ctx.tokenFile,
-                  mode: mode === undefined ? "absent" : `0${mode.toString(8)}`,
-                  ...(mode !== undefined && (mode & 0o077) !== 0
-                    ? { warning: `Readable by other users. Run: chmod 600 ${ctx.tokenFile}` }
+                oauth: {
+                  // Under a supervisor the callback port is assigned per
+                  // profile; this is the exact URL to register with the X app.
+                  redirect_uri: ctx.redirectUri,
+                  ...(ctx.tokenFile
+                    ? {
+                        token_file: {
+                          path: ctx.tokenFile,
+                          mode: mode === undefined ? "absent" : `0${mode.toString(8)}`,
+                          ...(mode !== undefined && (mode & 0o077) !== 0
+                            ? {
+                                warning: `Readable by other users. Run: chmod 600 ${ctx.tokenFile}`,
+                              }
+                            : {}),
+                        },
+                      }
                     : {}),
+                  ...(status.user.authenticated
+                    ? {}
+                    : {
+                        next_step:
+                          `Register ${ctx.redirectUri} as the app's callback URL at console.x.com ` +
+                          `if you have not yet, then call x_login (or press Sign in in Bastion).`,
+                      }),
                 },
               }
             : {}),
@@ -88,6 +120,7 @@ export const registerAuthTools = (server: McpServer, ctx: ToolContext): void => 
                   : "no OAuth2 client id configured",
                 ...(ctx.adsSetup ? { setup: ctx.adsSetup } : {}),
               },
+          ...warnings,
         };
       }),
   );
@@ -97,53 +130,63 @@ export const registerAuthTools = (server: McpServer, ctx: ToolContext): void => 
   const login = ctx.login;
 
   server.registerTool(
-    "x_auth_login",
+    "x_login",
     {
-      title: "X: Auth Login",
+      title: "X: Login",
       description:
         "Start the OAuth2 login. Prints a URL (and opens your browser) for you to authorize the " +
         "app, waits up to two minutes for the callback, then stores a refresh token in the token " +
-        "file with mode 600. Only needed for bookmarks, the home timeline and API writes — " +
-        "public reads and search work with the Bearer token alone.",
+        "file with mode 600. Only needed for bookmarks, the home timeline, API writes and Ads — " +
+        "public reads and search work with the Bearer token alone. The callback URL shown by " +
+        "x_get_auth_status must be registered with the X app first. Under Bastion, the Sign in " +
+        "button in the profile editor calls this tool.",
       inputSchema: z.object({
         open: z.boolean().default(true).describe("Open the authorize URL in your browser."),
       }),
-      annotations: { readOnlyHint: false, destructiveHint: false },
+      // Not readOnly (it opens a browser and writes a token file), but deliberately
+      // NOT gated behind allowWrites: logging in changes nothing on X, and gating
+      // it would leave a read-only install unable to see its own account.
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
     },
     async ({ open }) =>
       wrap(async () => {
         const result = await login(open);
         return {
-          authenticated: true,
+          signedIn: true,
           username: result.username,
           userId: result.userId,
           scopes: result.scopes,
           token_file: result.tokenFile,
-          note: "The refresh token is stored with mode 600 and rotates on every refresh.",
+          note:
+            "The refresh token is stored with mode 600 and rotates on every refresh. The tools " +
+            "that need a user session were already registered, so no restart is needed.",
         };
       }),
   );
 
   server.registerTool(
-    "x_auth_logout",
+    "x_logout",
     {
-      title: "X: Auth Logout",
+      title: "X: Logout",
       description:
         "Delete the stored OAuth2 tokens. The app-only Bearer token is unaffected, so public " +
-        "reads and search keep working.",
-      inputSchema: z.object({
-        confirm: z
-          .literal(true)
-          .describe("Must be true. You will need to run the login flow again to undo this."),
-      }),
+        "reads and search keep working. Undo it by logging in again. This does not revoke the " +
+        "app on X's side — do that at x.com/settings/connected_apps.",
+      // No `confirm`: a supervisor's Sign out calls this with no arguments, and
+      // the action is recoverable in the time it takes to log in again.
+      inputSchema: z.object({}),
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
     },
     async () =>
       wrap(async () => {
+        const had = ctx.tokenProvider.describe().user.authenticated;
         ctx.logout?.();
         return {
-          logged_out: true,
-          note: "Public reads and search continue to work if a Bearer token is configured.",
+          signedOut: had,
+          signedIn: false,
+          note: had
+            ? "Refresh token deleted. Public reads and search continue to work if a Bearer token is configured."
+            : "No login was stored.",
         };
       }),
   );

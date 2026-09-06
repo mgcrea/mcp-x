@@ -67,10 +67,13 @@ describe("loadConfig", () => {
     expect(hasApiCredentials(loadConfig({ X_CLIENT_ID: "c" }, absent))).toBe(true);
   });
 
-  it("rejects the paid write backend without a client id, pointing at the free one", () => {
-    expect(() => loadConfig({ X_BEARER_TOKEN: "t", X_WRITE_BACKEND: "api" }, absent)).toThrow(
-      /x-mcp login[\s\S]*intent/,
-    );
+  it("falls back from the paid write backend without a client id, and says so", () => {
+    // Not an exit: a thrown config error reaches the client as "Connection
+    // closed" with the sentence swallowed, so the flag is switched off and the
+    // sentence is carried where the banner and x_get_auth_status can print it.
+    const config = loadConfig({ X_BEARER_TOKEN: "t", X_WRITE_BACKEND: "api" }, absent);
+    expect(config.writeBackend).toBe("intent");
+    expect(config.warnings).toEqual([expect.stringMatching(/x-mcp login[\s\S]*intent/)]);
   });
 
   it("accepts the paid write backend once a client id is present", () => {
@@ -128,10 +131,34 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ X_BEARER_TOKEN: "t" }, absent)).not.toThrow();
   });
 
-  it("still rejects the one combination that is a genuine misconfiguration", () => {
-    // Missing credentials is a state to guide out of; asking for the paid write
-    // backend without the credential it requires is a contradiction.
-    expect(() => loadConfig({ X_WRITE_BACKEND: "api" }, absent)).toThrow(/x-mcp login/);
+  it("never throws over a contradiction between flags, only over a broken file", () => {
+    // Missing credentials is a state to guide out of, and so is asking for the
+    // paid write backend without the credential it requires: both are
+    // reported, neither takes the free tools down with it.
+    expect(() => loadConfig({ X_WRITE_BACKEND: "api" }, absent)).not.toThrow();
+    expect(loadConfig({ X_WRITE_BACKEND: "api" }, absent).warnings).toHaveLength(1);
+  });
+
+  it("reports a numeric env var it could not parse instead of silently dropping it", () => {
+    const config = loadConfig({ X_BEARER_TOKEN: "t", X_MONTHLY_BUDGET_USD: "25usd" }, absent);
+    expect(config.monthlyBudgetUsd).toBeUndefined();
+    expect(config.warnings).toEqual([expect.stringContaining("X_MONTHLY_BUDGET_USD")]);
+  });
+
+  it("reports a boolean it did not recognise, and treats it as off", () => {
+    const config = loadConfig({ X_BEARER_TOKEN: "t", X_ALLOW_WRITES: "enabled" }, absent);
+    expect(config.allowWrites).toBe(false);
+    expect(config.warnings).toEqual([expect.stringContaining("X_ALLOW_WRITES")]);
+    expect(loadConfig({ X_ALLOW_WRITES: "off" }, absent).warnings).toEqual([]);
+  });
+
+  it("takes the pricing table from X_PRICING as JSON, for deployments with no file", () => {
+    const config = loadConfig({ X_PRICING: '{"postRead": 0.01}' }, absent);
+    expect(config.pricing.postRead).toBe(0.01);
+    expect(config.pricing.userRead).toBe(DEFAULT_PRICING.userRead);
+    expect(loadConfig({ X_PRICING: "{nope" }, absent).warnings).toEqual([
+      expect.stringContaining("X_PRICING"),
+    ]);
   });
 
   it("parses scopes from a comma- or space-separated env var", () => {
@@ -232,16 +259,17 @@ describe("ads configuration", () => {
   });
 
   it("needs a user context, because a Bearer token cannot reach the Ads API", () => {
-    expect(() => loadConfig({ X_BEARER_TOKEN: "t", X_ADS_ENABLED: "1" }, absent)).toThrow(
-      /X_CLIENT_ID/,
-    );
+    const bearerOnly = loadConfig({ X_BEARER_TOKEN: "t", X_ADS_ENABLED: "1" }, absent);
+    expect(bearerOnly.adsEnabled).toBe(false);
+    expect(hasAdsAccess(bearerOnly)).toBe(false);
+    expect(bearerOnly.warnings).toEqual([expect.stringMatching(/X_CLIENT_ID/)]);
     expect(hasAdsAccess(loadConfig({ X_CLIENT_ID: "c", X_ADS_ENABLED: "1" }, absent))).toBe(true);
   });
 
-  it("refuses ads writes switched on without ads itself, rather than ignoring them", () => {
-    expect(() => loadConfig({ X_CLIENT_ID: "c", X_ADS_ALLOW_WRITES: "1" }, absent)).toThrow(
-      /X_ADS_ENABLED/,
-    );
+  it("switches ads writes off without ads itself, and says so rather than ignoring them", () => {
+    const config = loadConfig({ X_CLIENT_ID: "c", X_ADS_ALLOW_WRITES: "1" }, absent);
+    expect(config.adsAllowWrites).toBe(false);
+    expect(config.warnings).toEqual([expect.stringMatching(/X_ADS_ENABLED/)]);
   });
 
   it("defaults to production, and detects the sandbox by host", () => {

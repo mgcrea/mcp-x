@@ -5,12 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { AdsApiClient } from "#/client/ads";
 import { staticTokenProvider } from "#/client/auth";
 import { PreconditionError, XApiRequestError } from "#/client/errors";
-
-const json = (body: unknown, init: { status?: number; headers?: Record<string, string> } = {}) =>
-  new Response(JSON.stringify(body), {
-    status: init.status ?? 200,
-    headers: { "content-type": "application/json", ...init.headers },
-  });
+import { initOf, json, urlOf } from "#test/helpers";
 
 const clientWith = (fetchImpl: typeof fetch, baseUrl = "https://ads.test") =>
   new AdsApiClient({
@@ -19,11 +14,6 @@ const clientWith = (fetchImpl: typeof fetch, baseUrl = "https://ads.test") =>
     maxRetries: 0,
     baseUrl,
   });
-
-const urlOf = (mock: ReturnType<typeof vi.fn>, call = 0): string =>
-  String(mock.mock.calls[call]?.[0]);
-const initOf = (mock: ReturnType<typeof vi.fn>, call = 0): RequestInit =>
-  (mock.mock.calls[call]?.[1] ?? {}) as RequestInit;
 
 describe("cursor pagination", () => {
   it("follows next_cursor and sends it back as cursor, re-sending the original query", async () => {

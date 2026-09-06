@@ -17,7 +17,13 @@ import {
 import type { AdsContext } from "#/tools/index";
 import { compact, wrap } from "#/tools/util";
 
-/** Line-item enums, verbatim from the v12 reference. */
+/**
+ * Line-item enums, verbatim from the v12 reference and re-checked against
+ * docs.x.com on 2026-09-06. Both lists are complete as published: there is no
+ * `WEBSITE_CONVERSIONS` objective, and the asynchronous analytics
+ * `segmentation_type` really is only the five values in `analytics.ts` — worth
+ * recording, because both look like omissions and neither is one.
+ */
 const OBJECTIVES = [
   "APP_ENGAGEMENTS",
   "APP_INSTALLS",
@@ -210,7 +216,7 @@ export const registerAdsCampaignTools = (
         );
         return {
           account_id: id,
-          promoted_tweets: page.data,
+          promoted_tweets: shapeAds({ data: page.data }),
           ...(page.nextCursor ? { next_cursor: page.nextCursor } : {}),
           cost: adsCostNote(),
         };
@@ -395,7 +401,12 @@ export const registerAdsCampaignTools = (
           .array(z.enum(PLACEMENTS))
           .min(1)
           .describe("Where ads may appear. ALL_ON_TWITTER is the usual choice."),
-        startTime: adsTimeArg.describe("When delivery starts, ISO-8601 UTC on a whole hour."),
+        startTime: adsTimeArg
+          .optional()
+          .describe(
+            "When delivery starts, ISO-8601 UTC on a whole hour. Omit to start now, which is " +
+              "what X defaults to — a PAUSED line item does not deliver either way.",
+          ),
         endTime: adsTimeArg.optional().describe("When delivery stops. Omit to run open-ended."),
         bid: budgetArg
           .optional()

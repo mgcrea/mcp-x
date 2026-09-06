@@ -2,12 +2,14 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 
 import { PreconditionError } from "#/client/errors";
-import { shapePostsResponse, shapeUsersResponse, type ShapedUser } from "#/client/shape";
+import { shapeUsersResponse, type ShapedUser } from "#/client/shape";
 import type { XApiClient } from "#/client/x";
 import type { ToolContext } from "#/tools/index";
 import {
+  assertWithinBudget,
   cachedByIds,
   compact,
+  finishPostPage,
   maxResultsArg,
   paginationTokenArg,
   POST_QUERY,
@@ -33,12 +35,16 @@ const resolveUserId = async (
     throw new PreconditionError("Provide either `username` or `userId`.", { got: opts });
   }
   const handle = stripAt(opts.username);
+  // A handle lookup is a user read with an id nobody knows yet, so the guard
+  // sees it as one worst-case read rather than not at all.
+  assertWithinBudget(ctx, `lookup @${handle}`, ctx.ledger.estimateCount("user", 1));
   const raw = await client.get(`/2/users/by/username/${handle}`, compact({ ...USER_QUERY }));
   const shaped = shapeUsersResponse(raw);
   const user = shaped.users[0];
   if (!user?.id) {
     throw new PreconditionError(`No X account found for @${handle}.`, { username: handle });
   }
+  ctx.cache.set("user", user.id, user);
   ctx.ledger.record("user", [user.id]);
   return { id: user.id, user };
 };
@@ -94,6 +100,7 @@ export const registerUserTools = (
         }
 
         const handle = stripAt(username as string);
+        assertWithinBudget(ctx, "x_get_user", ctx.ledger.estimateCount("user", 1));
         const raw = await client.get(`/2/users/by/username/${handle}`, compact({ ...USER_QUERY }));
         const shaped = shapeUsersResponse(raw);
         const user = shaped.users[0];
@@ -117,7 +124,12 @@ export const registerUserTools = (
           .max(100)
           .optional()
           .describe('Handles to look up, e.g. ["mgcrea", "acme"].'),
-        userIds: z.array(userIdArg).min(1).max(100).optional(),
+        userIds: z
+          .array(userIdArg)
+          .min(1)
+          .max(100)
+          .optional()
+          .describe('Numeric ids to look up, e.g. ["44196397"]. Use one of usernames or userIds.'),
       }),
       annotations: { readOnlyHint: true },
     },
@@ -147,6 +159,7 @@ export const registerUserTools = (
         }
 
         const handles = [...new Set((usernames as string[]).map(stripAt))];
+        assertWithinBudget(ctx, "x_get_users", ctx.ledger.estimateCount("user", handles.length));
         const raw = await client.get("/2/users/by", compact({ usernames: handles, ...USER_QUERY }));
         const shaped = shapeUsersResponse(raw);
         for (const user of shaped.users) ctx.cache.set("user", user.id, user);
@@ -173,7 +186,7 @@ export const registerUserTools = (
       inputSchema: z.object({
         username: usernameArg.optional(),
         userId: userIdArg.optional(),
-        maxResults: maxResultsArg,
+        maxResults: maxResultsArg(ctx.defaultMaxResults),
         excludeReplies: z
           .boolean()
           .default(true)
@@ -203,6 +216,7 @@ export const registerUserTools = (
     }) =>
       wrap(async () => {
         const { id } = await resolveUserId(client, ctx, { username, userId });
+        assertWithinBudget(ctx, "x_get_user_posts", ctx.ledger.estimateCount("post", maxResults));
         const exclude = [
           ...(excludeReplies ? ["replies"] : []),
           ...(excludeReposts ? ["retweets"] : []),
@@ -219,18 +233,7 @@ export const registerUserTools = (
           }),
           { maxItems: maxResults },
         );
-        const shaped = shapePostsResponse({ data: res.data, includes: res.includes[0] ?? {} });
-        return {
-          user_id: id,
-          posts: shaped.posts,
-          result_count: shaped.posts.length,
-          ...(res.nextToken ? { next_token: res.nextToken } : {}),
-          cost: recordResultCost(
-            ctx,
-            "post",
-            shaped.posts.map((p) => p.id),
-          ),
-        };
+        return { user_id: id, ...finishPostPage(ctx, "post", res) };
       }),
   );
 
@@ -238,11 +241,15 @@ export const registerUserTools = (
     "x_get_user_mentions",
     {
       title: "X: Get User Mentions",
-      description: "Posts mentioning a user, newest first — who is talking about them, and what.",
+      description:
+        "Posts mentioning a user, newest first — who is talking about them, and what. Works " +
+        "with the app-only Bearer token for any public account. Costs one post read per " +
+        "mention returned (about $0.005 each, at least 5 per page); the handle lookup, when " +
+        "`username` is given instead of `userId`, is one user read on top.",
       inputSchema: z.object({
         username: usernameArg.optional(),
         userId: userIdArg.optional(),
-        maxResults: maxResultsArg,
+        maxResults: maxResultsArg(ctx.defaultMaxResults),
         startTime: z.string().optional().describe("Only posts at or after this ISO-8601 UTC time."),
         endTime: z.string().optional().describe("Only posts before this ISO-8601 UTC time."),
         paginationToken: paginationTokenArg,
@@ -252,6 +259,11 @@ export const registerUserTools = (
     async ({ username, userId, maxResults, startTime, endTime, paginationToken }) =>
       wrap(async () => {
         const { id } = await resolveUserId(client, ctx, { username, userId });
+        assertWithinBudget(
+          ctx,
+          "x_get_user_mentions",
+          ctx.ledger.estimateCount("post", maxResults),
+        );
         const res = await client.paginate(
           `/2/users/${id}/mentions`,
           compact({
@@ -263,18 +275,7 @@ export const registerUserTools = (
           }),
           { maxItems: maxResults },
         );
-        const shaped = shapePostsResponse({ data: res.data, includes: res.includes[0] ?? {} });
-        return {
-          user_id: id,
-          posts: shaped.posts,
-          result_count: shaped.posts.length,
-          ...(res.nextToken ? { next_token: res.nextToken } : {}),
-          cost: recordResultCost(
-            ctx,
-            "post",
-            shaped.posts.map((p) => p.id),
-          ),
-        };
+        return { user_id: id, ...finishPostPage(ctx, "post", res) };
       }),
   );
 };

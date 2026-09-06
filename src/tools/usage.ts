@@ -11,9 +11,9 @@ export const registerUsageTools = (
   ctx: ToolContext,
 ): void => {
   server.registerTool(
-    "x_usage_report",
+    "x_get_usage_report",
     {
-      title: "X: Usage Report",
+      title: "X: Get Usage Report",
       description:
         "What this session has spent against X's pay-per-use rates, how much the dedup cache " +
         "saved, and the pricing table used to compute it. Estimates only, counted since this " +
@@ -25,9 +25,9 @@ export const registerUsageTools = (
   );
 
   server.registerTool(
-    "x_rate_limit_status",
+    "x_get_rate_limit_status",
     {
-      title: "X: Rate Limit Status",
+      title: "X: Get Rate Limit Status",
       description:
         "Rate-limit headroom per endpoint, as of the last response from each. Empty until at " +
         "least one request has been made. Useful when a call has just been rate-limited and you " +

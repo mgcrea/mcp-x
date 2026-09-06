@@ -38,21 +38,21 @@ Credits are prepurchased in the developer console; at zero credits, requests are
 
 Run `x_count_recent` before a broad search — it returns totals without reading any posts, so it costs nothing and tells you what the search would cost. `x_build_search_query` is likewise free and local.
 
-> Prices are X's published list rates, transcribed 2026-07-19. Override them via the config file's `pricing` key if they change. `x_usage_report` estimates locally and is not authoritative — the developer portal is.
+> Prices are X's published list rates, transcribed 2026-07-19. Override them via the config file's `pricing` key, or `X_PRICING` as a JSON object, if they change. `x_get_usage_report` estimates locally and is not authoritative — the developer portal is.
 
-**Ads is billed elsewhere.** Ads API calls are not metered by X's pay-per-use read pricing, so they cost nothing and never appear in `x_usage_report`. What they manage does: a campaign spends your advertising budget, on X's invoice rather than the API's, and no tool here can see that number. Treat `x_usage_report` as silent on ads rather than as reporting zero.
+**Ads is billed elsewhere.** Ads API calls are not metered by X's pay-per-use read pricing, so they cost nothing and never appear in `x_get_usage_report`. What they manage does: a campaign spends your advertising budget, on X's invoice rather than the API's, and no tool here can see that number. Treat `x_get_usage_report` as silent on ads rather than as reporting zero.
 
 ## Security
 
-- **Supply chain.** Two runtime dependencies: the MCP SDK and zod. The HTTP client is ~250 lines of `fetch`.
+- **Supply chain.** Two runtime dependencies: the MCP SDK and zod. The HTTP layer is hand-rolled `fetch` — no HTTP library, no logger, nothing else on the tree.
 - **Verified builds.** npm releases carry [provenance](https://docs.npmjs.com/generating-provenance-statements) via OIDC trusted publishing; container images are multi-arch, ship an SBOM, and are signed with [cosign](https://docs.sigstore.dev/cosign/signing/overview/).
-- **Your credentials.** Read from the environment or a config file you control, sent only to `api.x.com` (and `ads-api.x.com` when ads is enabled), never logged. The **one** file this server writes is `tokens.json` (mode 600), and only if you use OAuth — it has to persist a rotating refresh token. Everything else is read-only.
+- **Your credentials.** Read from the environment or a config file you control, sent only to `api.x.com` (and `ads-api.x.com` when ads is enabled), never logged. The one other host ever contacted is `ton.twimg.com`, where X serves finished analytics reports — those downloads carry no credential at all, and any other host in a report URL is refused. The **one** file this server writes is `tokens.json` (mode 600), and only if you use OAuth — it has to persist a rotating refresh token. Everything else is read-only. Every request has a 30-second deadline, and a rate-limit window longer than 30 seconds is reported rather than waited out.
 - **Blast radius.** Paid writes are off by default and _unregistered_ rather than refused, so an agent cannot call what does not exist. The free compose path never publishes without a human clicking Post. Ads writes are a separate switch on the same principle, campaigns and line items are created `PAUSED` unless a call explicitly asks otherwise, and budgets are taken in major currency units — the ×1,000,000 mistake is not expressible.
 - **No scraping.** This server never touches session cookies or your password. Tools that do are a ban risk regardless of how they are marketed.
 
 ## Configure
 
-**The server starts with no configuration at all.** In that state it registers only the tools that need no credentials — `x_compose_post`, `x_validate_post`, `x_build_search_query` and `x_auth_status` — and `x_auth_status` tells you exactly what to set for the rest. It never refuses to start over missing credentials, because an MCP server that exits shows up in the client as a bare `Connection closed` with the explanation swallowed.
+**The server starts with no configuration at all.** In that state it registers only the tools that need no credentials — `x_compose_post`, `x_validate_post`, `x_build_search_query` and `x_get_auth_status` — and `x_get_auth_status` tells you exactly what to set for the rest. It never refuses to start over missing credentials, because an MCP server that exits shows up in the client as a bare `Connection closed` with the explanation swallowed. The same goes for a contradiction between flags (`X_ADS_ENABLED` without a client id, say): the flag is switched off, and the reason is printed at startup and returned by `x_get_auth_status` under `warnings`.
 
 To read anything, one variable is required:
 
@@ -60,7 +60,21 @@ To read anything, one variable is required:
 export X_BEARER_TOKEN="..."   # console.x.com → your app → Keys and Tokens
 ```
 
-That covers every public read: lookup, search, profiles, timelines — no OAuth needed. See [Getting credentials](#getting-credentials) below, and [.env.example](./.env.example) for the rest.
+That covers every public read: lookup, search, profiles, timelines — no OAuth needed. See [Getting credentials](#getting-credentials) below, and [.env.example](./.env.example) for the rest. The ones worth knowing by name:
+
+| Variable                | Meaning                                                                                                            |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `X_BEARER_TOKEN`        | App-only Bearer token. Every public read.                                                                          |
+| `X_CLIENT_ID`           | OAuth 2.0 client id. Bookmarks, home timeline, API writes, Ads.                                                    |
+| `X_MONTHLY_BUDGET_USD`  | Spend ceiling for this process. A read whose estimate would cross it is refused before the request goes out.       |
+| `X_DEFAULT_MAX_RESULTS` | Default page size for every read tool (10).                                                                        |
+| `X_PRICING`             | JSON object overriding the price table, for deployments with no config file.                                       |
+| `X_ALLOW_WRITES`        | With `X_WRITE_BACKEND=api`, registers the paid `x_create_post` / `x_delete_post`, and lets `x_request` mutate.     |
+| `X_ENABLE_FULL_ARCHIVE` | Registers `x_search_all`.                                                                                          |
+| `X_ADS_ENABLED`         | Registers the Ads API tools (needs `X_CLIENT_ID`).                                                                 |
+| `X_ADS_ALLOW_WRITES`    | Registers the campaign-mutating Ads tools.                                                                         |
+| `X_ADS_ACCOUNT_ID`      | The ads account to act on. Optional with exactly one account; with several, a call without `accountId` is refused. |
+| `X_ADS_BASE_URL`        | Point at the sandbox (see below) before touching a live account.                                                   |
 
 ### Getting credentials
 
@@ -87,6 +101,8 @@ Creating an app and getting credentials appears to be free; **making calls is no
 export X_CLIENT_ID="..."      # the Client ID of a Native App (public PKCE client)
 npx @mgcrea/mcp-x login       # opens a browser, stores a refresh token (mode 600)
 ```
+
+Or, from inside a client, call `x_login`. Under [Bastion](https://github.com/mgcrea/bastion) the profile editor's **Sign in with X** button does the same through the server's own tools — Bastion assigns the callback port per profile, so read the URL from `x_get_auth_status` and register that exact one with the app.
 
 ### Ads API access
 
@@ -179,13 +195,15 @@ Writes are marked `*`, and `†` means a `confirm: true` argument is required. T
 
 **Timelines** — `x_get_home_timeline` · `x_get_bookmarks` _(need OAuth login; X serves these for your own account only)_
 
-**Auth** — `x_auth_status` · `x_auth_login` \* · `x_auth_logout` \*† _(the last two need `X_CLIENT_ID`)_
+**Auth** — `x_get_auth_status` · `x_login` \* · `x_logout` \* _(the last two need `X_CLIENT_ID`)_
 
 **Ads — reads** — `x_ads_get_accounts` · `x_ads_get_funding_instruments` · `x_ads_get_campaigns` · `x_ads_get_line_items` · `x_ads_get_promoted_tweets` · `x_ads_get_targeting_criteria` · `x_ads_search_targeting_options` · `x_ads_get_audiences` · `x_ads_get_stats` · `x_ads_create_stats_job` · `x_ads_get_stats_jobs` · `x_ads_download_stats_job` _(need `X_ADS_ENABLED` and an OAuth login)_
 
-**Ads — writes** \* † — `x_ads_create_campaign` · `x_ads_update_campaign` · `x_ads_delete_campaign` · `x_ads_create_line_item` · `x_ads_update_line_item` · `x_ads_delete_line_item` · `x_ads_create_targeting_criterion` · `x_ads_delete_targeting_criterion` · `x_ads_create_promoted_tweet` · `x_ads_delete_promoted_tweet` · `x_ads_set_entity_status` _(need `X_ADS_ALLOW_WRITES=1`)_
+**Ads — writes** \* † — `x_ads_create_campaign` · `x_ads_update_campaign` · `x_ads_delete_campaign` · `x_ads_create_line_item` · `x_ads_update_line_item` · `x_ads_delete_line_item` · `x_ads_create_targeting_criterion` · `x_ads_delete_targeting_criterion` · `x_ads_create_promoted_tweet` · `x_ads_delete_promoted_tweet` · `x_ads_set_entity_status` _(need `X_ADS_ALLOW_WRITES=1`)_ · `x_ads_create_sandbox_account` _(sandbox only)_
 
-**Usage** — `x_usage_report` · `x_rate_limit_status`
+**Usage** — `x_get_usage_report` · `x_get_rate_limit_status`
+
+**Escape hatch** — `x_request` — any `/2/` or `/12/` endpoint this server does not wrap, returned raw. GET only until a write gate is on; a mutation additionally takes `confirm: true`. Reads made here are billed by X but not counted by `x_get_usage_report`.
 
 ### Reading posts
 
@@ -242,9 +260,9 @@ The URL comes back whether or not a browser could be opened, so Docker and SSH b
 2. You ran `pnpm build` — `dist/cli.js` has to exist.
 3. Run it by hand to see stderr, which MCP clients swallow: `X_BEARER_TOKEN=... node dist/cli.js`. A config error prints one readable line; add `X_DEBUG=1` for the stack.
 
-**Only four tools show up** — no credentials are configured. Call `x_auth_status`; it returns the setup steps.
+**Only four tools show up** — no credentials are configured. Call `x_get_auth_status`; it returns the setup steps.
 
-**I want OAuth but see no way in** — OAuth needs an app you register. See [Getting credentials](#getting-credentials): create a **Native App** at console.x.com, set `X_CLIENT_ID` to its Client ID, register the callback, then run `npx @mgcrea/mcp-x login` (or call `x_auth_login`). There is no way to log in without a client id — X has nothing to authorize against.
+**I want OAuth but see no way in** — OAuth needs an app you register. See [Getting credentials](#getting-credentials): create a **Native App** at console.x.com, set `X_CLIENT_ID` to its Client ID, register the callback, then run `npx @mgcrea/mcp-x login` (or call `x_login`). There is no way to log in without a client id — X has nothing to authorize against.
 
 **`403 client-not-enrolled` right after a successful login** — the app is in the legacy Free package or the Development environment. Move it to **Pay-per-use / Production** at console.x.com. Nothing about your token or scopes is wrong.
 
@@ -254,21 +272,21 @@ The URL comes back whether or not a browser could be opened, so Docker and SSH b
 
 - **Recent search reaches back 7 days.** `x_get_thread` inherits that limit: an older conversation returns only its root post. Full-archive search (back to March 2006) needs a paid tier and `X_ENABLE_FULL_ARCHIVE=1`, and is capped at one request per second.
 - **Bookmarks and the home timeline are self-only.** X does not serve anyone else's, so those tools take no user argument — the id comes from your token.
-- **Rate limits are per endpoint and per credential**, not per plan: recent search allows 450 requests / 15 min app-only vs 300 with a user token. `x_rate_limit_status` shows the headroom X last reported.
-- **Search asks for at least 10 results.** X's minimum for `max_results` is 10, so a request for 3 fetches 10 and returns 3. Billing follows what X actually returned.
-- **`x_usage_report` counts this process only.** It is not persisted across restarts and does not know about spend from other clients.
+- **Rate limits are per endpoint and per credential**, not per plan: recent search allows 450 requests / 15 min app-only vs 300 with a user token. `x_get_rate_limit_status` shows the headroom X last reported.
+- **Search asks for at least 10 results.** X's minimum for `max_results` is 10 (5 on user timelines), and X bills every post it returns — so a request for 3 fetches 10, returns all 10, and reports all 10 in `cost`. Trimming to 3 would waste seven paid posts and make `next_token` skip them.
+- **`x_get_usage_report` counts this process only.** It is not persisted across restarts and does not know about spend from other clients.
 
 ## Develop
 
 ```bash
 pnpm install
-pnpm test          # vitest, fully offline — every test injects fetch
+pnpm test          # vitest — every test injects fetch; nothing leaves the machine
 pnpm typecheck
 pnpm lint && pnpm format:check
 pnpm build
 ```
 
-Tests never touch the network: `createServer` accepts an injectable `fetch`, `logger` and `tokenProvider`, and `test/tools.test.ts` drives the real server through the MCP SDK's in-memory transport.
+Tests never touch the network: `createServer` accepts an injectable `fetch`, `logger` and `tokenProvider`, and `test/tools.test.ts` drives the real server through the MCP SDK's in-memory transport. The only sockets opened are two loopback listeners in `test/oauth.test.ts`, which exercise the real OAuth callback server on ports 8798 and 8799.
 
 ### Publish
 

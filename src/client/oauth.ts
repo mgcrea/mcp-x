@@ -3,6 +3,7 @@ import { createServer as createHttpServer } from "node:http";
 
 import type { Logger } from "#/client/auth";
 import { PreconditionError } from "#/client/errors";
+import { DEFAULT_REQUEST_TIMEOUT_MS, fetchWithTimeout, safeJsonParse } from "#/client/http";
 import type { StoredTokens, TokenStore } from "#/client/tokens";
 import { TOKEN_FILE_VERSION } from "#/client/tokens";
 import type { Config } from "#/config";
@@ -84,18 +85,34 @@ const formPost = async (
     headers.Authorization = `Basic ${basic}`;
   }
 
-  const res = await fetchImpl(`${config.baseUrl.replace(/\/+$/, "")}${TOKEN_PATH}`, {
-    method: "POST",
-    headers,
-    body: body.toString(),
-  });
+  const res = await fetchWithTimeout(
+    fetchImpl,
+    `${config.baseUrl.replace(/\/+$/, "")}${TOKEN_PATH}`,
+    { method: "POST", headers, body: body.toString() },
+    DEFAULT_REQUEST_TIMEOUT_MS,
+    "The X OAuth token endpoint",
+  );
   const text = await res.text();
   if (!res.ok) {
-    throw new Error(
-      `X rejected the OAuth token request: HTTP ${res.status} — ${text.slice(0, 400)}`,
-    );
+    throw new Error(`X rejected the OAuth token request: HTTP ${res.status}${oauthDetail(text)}`);
   }
   return JSON.parse(text) as TokenResponse;
+};
+
+/**
+ * Only the two fields RFC 6749 defines are quoted from an error body. The
+ * request that produced it carried the refresh token, and `X_BASE_URL` is
+ * user-settable, so echoing an arbitrary body into a tool result would let a
+ * misconfigured endpoint round-trip the credential into the transcript.
+ */
+const oauthDetail = (text: string): string => {
+  const parsed = safeJsonParse(text);
+  if (typeof parsed !== "object" || parsed === null) return "";
+  const rec = parsed as Record<string, unknown>;
+  const parts = [rec.error, rec.error_description].filter(
+    (v): v is string => typeof v === "string" && v !== "",
+  );
+  return parts.length > 0 ? ` — ${parts.join(": ")}` : "";
 };
 
 export const createOAuthClient = (config: Config, fetchImpl: typeof fetch = fetch): OAuthClient => {
@@ -177,10 +194,20 @@ export const awaitCallback = (opts: {
   state: string;
   timeoutMs?: number;
   logger?: Logger | undefined;
-}): { url: Promise<never> | undefined; code: Promise<string>; close: () => void } => {
+}): { code: Promise<string>; close: () => void } => {
   const url = new URL(opts.redirectUri);
   const port = Number(url.port);
   const expectedPath = url.pathname;
+  // `http://127.0.0.1/callback` parses to port "", and Number("") is 0 —
+  // which asks Node for an ephemeral port while the browser goes to 80. That
+  // login would wait its whole timeout out with nothing to diagnose.
+  if (!Number.isInteger(port) || port <= 0) {
+    throw new PreconditionError(
+      `X_REDIRECT_URI (${opts.redirectUri}) has no explicit port. Use a loopback URL with one, ` +
+        `e.g. ${"http://127.0.0.1:8723/callback"}, and register that exact URL with the X app.`,
+      { redirectUri: opts.redirectUri },
+    );
+  }
 
   let settle: { resolve: (code: string) => void; reject: (err: Error) => void };
   const code = new Promise<string>((resolve, reject) => {
@@ -198,16 +225,20 @@ export const awaitCallback = (opts: {
     const returnedCode = requestUrl.searchParams.get("code");
     const error = requestUrl.searchParams.get("error");
 
-    if (error) {
-      res.writeHead(400, { "content-type": "text/html" }).end(FAILURE_PAGE);
-      settle.reject(new Error(`X denied the authorization: ${error}`));
-      return;
-    }
+    // State first, before `error` is even looked at: a callback that does not
+    // carry this login's state is not this login's callback, and any web page
+    // can make a browser GET `127.0.0.1:<port>/callback?error=x` with an
+    // image tag. That must not be able to cancel a login in progress.
     if (!statesMatch(returnedState, opts.state)) {
       res.writeHead(400, { "content-type": "text/html" }).end(FAILURE_PAGE);
       settle.reject(
         new Error("The callback did not come from the login that was started (state mismatch)."),
       );
+      return;
+    }
+    if (error) {
+      res.writeHead(400, { "content-type": "text/html" }).end(FAILURE_PAGE);
+      settle.reject(new Error(`X denied the authorization: ${error}`));
       return;
     }
     if (!returnedCode) {
@@ -249,7 +280,7 @@ export const awaitCallback = (opts: {
   };
   void code.finally(close).catch(() => {});
 
-  return { url: undefined, code, close };
+  return { code, close };
 };
 
 export type LoginResult = { tokens: StoredTokens; authorizeUrl: string };
@@ -301,7 +332,7 @@ export const startLoginFlow = async (opts: {
   const oauth = createOAuthClient(config, fetchImpl);
   const res = await oauth.exchangeCode(code, verifier);
 
-  // One owned read ($0.001) to learn who just logged in, so x_auth_status and
+  // One owned read ($0.001) to learn who just logged in, so x_get_auth_status and
   // the timeline tools do not have to ask again.
   let userId: string | undefined;
   let username: string | undefined;

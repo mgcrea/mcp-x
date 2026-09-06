@@ -335,16 +335,30 @@ export const shapeUsersResponse = (response: unknown): ShapedUsers => {
   };
 };
 
-/** Assemble the shaped form from a paginated read, where includes arrive per page. */
-export const shapePaginatedPosts = (
-  data: unknown[],
-  includes: Rec[],
-  nextToken?: string,
-): ShapedPosts => {
-  const index = buildIncludesIndex(includes);
+/** What `XApiClient.paginate` hands back, as far as shaping is concerned. */
+export type PostPage = {
+  data: unknown[];
+  /** One block per page — merged here, which is the whole point of this function. */
+  includes: Rec[];
+  nextToken?: string | undefined;
+  /** Per-id failures X reports alongside a 200, collected across pages. */
+  errors?: unknown[] | undefined;
+};
+
+/**
+ * Assemble the shaped form from a paginated read, where includes arrive per
+ * page. Every tool that paginates goes through here rather than through
+ * `shapePostsResponse` with the first page's includes: a post on page two whose
+ * author was only sideloaded on page two would otherwise come back as
+ * "@unknown", which looks exactly like a deleted account and is not one.
+ */
+export const shapePaginatedPosts = (page: PostPage): ShapedPosts => {
+  const index = buildIncludesIndex(page.includes);
+  const notFound = notFoundIds({ errors: page.errors ?? [] });
   return {
-    posts: data.filter(isRecord).map((raw) => shapePost(raw, index)),
-    result_count: data.length,
-    ...(nextToken ? { next_token: nextToken } : {}),
+    posts: page.data.filter(isRecord).map((raw) => shapePost(raw, index)),
+    result_count: page.data.length,
+    ...(page.nextToken ? { next_token: page.nextToken } : {}),
+    ...(notFound ? { not_found: notFound } : {}),
   };
 };

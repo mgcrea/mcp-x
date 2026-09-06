@@ -1,17 +1,19 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 
-import { isRecord, shapePostsResponse, type ShapedPost } from "#/client/shape";
+import { shapePostsResponse, type ShapedPost } from "#/client/shape";
 import type { XApiClient } from "#/client/x";
 import type { ToolContext } from "#/tools/index";
 import {
+  assertWithinBudget,
   cachedByIds,
   compact,
+  finishPostPage,
   maxResultsArg,
+  mergeCostNotes,
   paginationTokenArg,
   POST_QUERY,
   postIdArg,
-  recordResultCost,
   wrap,
 } from "#/tools/util";
 
@@ -104,31 +106,28 @@ export const registerPostTools = (
       description:
         "Reconstruct a conversation: every reply sharing the post's conversation_id, oldest " +
         "first. Note that this searches the last 7 days only, so an older thread returns just " +
-        "the root post. Costs one post read per reply returned.",
+        "the root post. Costs one post read for the root plus one per reply returned; a root " +
+        "already read today is free.",
       inputSchema: z.object({
         postId: postIdArg,
-        maxResults: maxResultsArg,
+        maxResults: maxResultsArg(ctx.defaultMaxResults),
       }),
       annotations: { readOnlyHint: true },
     },
     async ({ postId, maxResults }) =>
       wrap(async () => {
         // The root post carries the conversation_id, which may differ from its
-        // own id when the post is itself a reply.
-        const rootRaw = await client.get(`/2/tweets/${postId}`, compact({ ...POST_QUERY }));
-        const rootShaped = shapePostsResponse({
-          ...(isRecord(rootRaw) ? rootRaw : {}),
-          data: isRecord(rootRaw) && isRecord(rootRaw.data) ? [rootRaw.data] : [],
-        });
-        const root = rootShaped.posts[0];
-        if (!root) {
-          return {
-            error: `X returned no post for id ${postId}.`,
-            cost: recordResultCost(ctx, "post", []),
-          };
+        // own id when the post is itself a reply. Read through the cache so a
+        // root fetched by x_get_post moments ago is neither re-requested nor
+        // re-billed, and so the budget guard sees it.
+        const root = await cachedByIds(ctx, "post", [postId], fetchPosts, "x_get_thread");
+        const rootPost = root.items[0];
+        if (!rootPost) {
+          return { error: `X returned no post for id ${postId}.`, cost: root.cost };
         }
 
-        const conversationId = root.conversation_id ?? root.id;
+        assertWithinBudget(ctx, "x_get_thread", ctx.ledger.estimateCount("post", maxResults));
+        const conversationId = rootPost.conversation_id ?? rootPost.id;
         const replies = await client.paginate(
           "/2/tweets/search/recent",
           compact({
@@ -139,23 +138,18 @@ export const registerPostTools = (
           }),
           { maxItems: maxResults },
         );
-
-        const shapedReplies = shapePostsResponse({
-          data: replies.data,
-          includes: replies.includes[0] ?? {},
-        });
+        const page = finishPostPage(ctx, "post", replies);
         // Oldest first: a thread reads top-down, but search returns newest first.
-        const ordered = shapedReplies.posts.toReversed();
-        const ids = [root.id, ...ordered.map((p) => p.id)];
+        const ordered = page.posts.toReversed().filter((p) => p.id !== rootPost.id);
 
         return {
           conversation_id: conversationId,
-          posts: [root, ...ordered.filter((p) => p.id !== root.id)],
-          ...(replies.nextToken ? { next_token: replies.nextToken } : {}),
+          posts: [rootPost, ...ordered],
+          ...(page.next_token ? { next_token: page.next_token } : {}),
           note:
             "Recent search reaches back 7 days. Replies older than that are not returned even " +
             "if the thread has more.",
-          cost: recordResultCost(ctx, "post", ids),
+          cost: mergeCostNotes(root.cost, page.cost),
         };
       }),
   );
@@ -164,16 +158,20 @@ export const registerPostTools = (
     "x_get_quotes",
     {
       title: "X: Get Quotes",
-      description: "List posts quoting a given post, newest first.",
+      description:
+        "List posts quoting a given post, newest first — who is amplifying or arguing with it. " +
+        "Works with the app-only Bearer token. Costs one post read per quote returned (about " +
+        "$0.005 each, and X serves at least 10 per page), so keep maxResults low on a viral post.",
       inputSchema: z.object({
         postId: postIdArg,
-        maxResults: maxResultsArg,
+        maxResults: maxResultsArg(ctx.defaultMaxResults),
         paginationToken: paginationTokenArg,
       }),
       annotations: { readOnlyHint: true },
     },
     async ({ postId, maxResults, paginationToken }) =>
       wrap(async () => {
+        assertWithinBudget(ctx, "x_get_quotes", ctx.ledger.estimateCount("post", maxResults));
         const res = await client.paginate(
           `/2/tweets/${postId}/quote_tweets`,
           compact({
@@ -183,17 +181,7 @@ export const registerPostTools = (
           }),
           { maxItems: maxResults },
         );
-        const shaped = shapePostsResponse({ data: res.data, includes: res.includes[0] ?? {} });
-        return {
-          posts: shaped.posts,
-          result_count: shaped.posts.length,
-          ...(res.nextToken ? { next_token: res.nextToken } : {}),
-          cost: recordResultCost(
-            ctx,
-            "post",
-            shaped.posts.map((p) => p.id),
-          ),
-        };
+        return finishPostPage(ctx, "post", res);
       }),
   );
 };

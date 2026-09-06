@@ -3,12 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { bearerTokenProvider, staticTokenProvider, type TokenProvider } from "#/client/auth";
 import { UserContextRequiredError, XApiRequestError } from "#/client/errors";
 import { XApiClient } from "#/client/x";
-
-const json = (body: unknown, init: { status?: number; headers?: Record<string, string> } = {}) =>
-  new Response(JSON.stringify(body), {
-    status: init.status ?? 200,
-    headers: { "content-type": "application/json", ...init.headers },
-  });
+import { initOf, json, urlOf } from "#test/helpers";
 
 const clientWith = (fetchImpl: typeof fetch, provider: TokenProvider = staticTokenProvider("t")) =>
   new XApiClient({
@@ -17,11 +12,6 @@ const clientWith = (fetchImpl: typeof fetch, provider: TokenProvider = staticTok
     maxRetries: 3,
     baseUrl: "https://x.test",
   });
-
-const urlOf = (mock: ReturnType<typeof vi.fn>, call = 0): string =>
-  String(mock.mock.calls[call]?.[0]);
-const initOf = (mock: ReturnType<typeof vi.fn>, call = 0): RequestInit =>
-  (mock.mock.calls[call]?.[1] ?? {}) as RequestInit;
 
 describe("query building", () => {
   it("comma-joins arrays rather than repeating the key", async () => {
@@ -225,7 +215,7 @@ describe("paginate", () => {
     expect(urlOf(f, 1)).toContain("query=rust");
   });
 
-  it("stops at maxItems and truncates, rather than spending a page further", async () => {
+  it("stops fetching at maxItems but returns every post it paid for", async () => {
     const f = vi
       .fn()
       .mockResolvedValueOnce(page(["1", "2"], "cursor-a"))
@@ -235,9 +225,26 @@ describe("paginate", () => {
       { query: "rust" },
       { maxItems: 3 },
     );
-    expect(res.data).toHaveLength(3);
+    // X billed four posts; trimming to three would waste one and make
+    // cursor-b skip it on the next call.
+    expect(res.data).toHaveLength(4);
     expect(f).toHaveBeenCalledTimes(2);
     expect(res.nextToken).toBe("cursor-b");
+  });
+
+  it("collects per-id errors from every page", async () => {
+    const f = vi
+      .fn()
+      .mockResolvedValueOnce(
+        json({ data: [{ id: "1" }], errors: [{ value: "9" }], meta: { next_token: "a" } }),
+      )
+      .mockResolvedValueOnce(json({ data: [{ id: "2" }], errors: [{ value: "8" }], meta: {} }));
+    const res = await clientWith(f as unknown as typeof fetch).paginate(
+      "/2/tweets/search/recent",
+      { query: "rust" },
+      { maxItems: 100 },
+    );
+    expect(res.errors).toEqual([{ value: "9" }, { value: "8" }]);
   });
 
   it("stops at maxPages even when the cursor keeps going", async () => {

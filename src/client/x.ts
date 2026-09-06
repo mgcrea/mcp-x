@@ -2,7 +2,9 @@ import type { AuthContext, Logger, TokenProvider } from "#/client/auth";
 import { type XApiError, XApiRequestError } from "#/client/errors";
 import {
   buildQuery,
+  DEFAULT_REQUEST_TIMEOUT_MS,
   endpointKey,
+  fetchWithTimeout,
   numberOrUndefined,
   safeJsonParse,
   withRetry,
@@ -26,6 +28,8 @@ export type XApiClientOptions = {
   baseUrl?: string;
   tokenProvider: TokenProvider;
   maxRetries?: number;
+  /** Deadline per HTTP round trip. See DEFAULT_REQUEST_TIMEOUT_MS. */
+  requestTimeoutMs?: number;
   fetch?: typeof fetch;
   logger?: Logger;
   userAgent?: string;
@@ -41,6 +45,7 @@ export class XApiClient {
   private readonly baseUrl: string;
   private readonly tokenProvider: TokenProvider;
   private readonly maxRetries: number;
+  private readonly requestTimeoutMs: number;
   private readonly fetchImpl: typeof fetch;
   private readonly logger: Logger | undefined;
   private readonly userAgent: string;
@@ -50,6 +55,7 @@ export class XApiClient {
     this.baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
     this.tokenProvider = opts.tokenProvider;
     this.maxRetries = opts.maxRetries ?? 3;
+    this.requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.fetchImpl = opts.fetch ?? fetch;
     this.logger = opts.logger;
     this.userAgent = opts.userAgent ?? "mcp-x-js";
@@ -82,16 +88,22 @@ export class XApiClient {
     const res = await withRetry(
       async () => {
         const token = await this.tokenProvider.getToken(auth);
-        return this.fetchImpl(url, {
-          method,
-          headers: {
-            Accept: "application/json",
-            Authorization: `Bearer ${token}`,
-            "User-Agent": this.userAgent,
-            ...(hasBody ? { "Content-Type": "application/json" } : {}),
+        return fetchWithTimeout(
+          this.fetchImpl,
+          url,
+          {
+            method,
+            headers: {
+              Accept: "application/json",
+              Authorization: `Bearer ${token}`,
+              "User-Agent": this.userAgent,
+              ...(hasBody ? { "Content-Type": "application/json" } : {}),
+            },
+            ...(hasBody ? { body: JSON.stringify(opts.body) } : {}),
           },
-          ...(hasBody ? { body: JSON.stringify(opts.body) } : {}),
-        });
+          this.requestTimeoutMs,
+          `X API ${method} ${path}`,
+        );
       },
       {
         maxRetries: this.maxRetries,
@@ -135,23 +147,34 @@ export class XApiClient {
    * $0.005 a post, walking a busy hashtag to the end is a three-figure mistake
    * an agent can make in one call. `maxItems` is the one callers actually set.
    *
+   * `maxItems` decides when to stop asking for pages — it never trims what came
+   * back. X floors `max_results` at 10 (5 on timelines) and bills every post it
+   * returns, so a caller who asked for 3 has already paid for 10: trimming would
+   * throw away bought data, and the `nextToken` handed back would then skip the
+   * trimmed posts on the following page, silently. Everything fetched is
+   * returned and it is the caller's job to bill all of it.
+   *
    * X carries the cursor in `meta.next_token` and expects it back as
    * `pagination_token`, so — unlike a `links.next` API — the original query has
-   * to be re-sent on every page rather than replaced.
+   * to be re-sent on every page rather than replaced. Per-id `errors` (a deleted
+   * post in the middle of a page arrives as a 200 with a footnote) are collected
+   * across pages too, so the shaping layer can report `not_found`.
    */
   async paginate<T = unknown>(
     path: string,
     query: Query,
     opts: { maxItems: number; maxPages?: number; auth?: AuthContext },
-  ): Promise<{ data: T[]; pages: number; nextToken?: string; includes: Rec[] }> {
+  ): Promise<{ data: T[]; pages: number; nextToken?: string; includes: Rec[]; errors: unknown[] }> {
     type Envelope = {
       data?: T[];
       includes?: Rec;
+      errors?: unknown[];
       meta?: { next_token?: unknown };
     };
     const maxPages = opts.maxPages ?? 10;
     const collected: T[] = [];
     const includes: Rec[] = [];
+    const errors: unknown[] = [];
     let token: string | undefined;
     let pages = 0;
     let nextToken: string | undefined;
@@ -164,6 +187,7 @@ export class XApiClient {
       pages += 1;
       if (Array.isArray(res?.data)) collected.push(...res.data);
       if (res?.includes) includes.push(res.includes);
+      if (Array.isArray(res?.errors)) errors.push(...res.errors);
 
       const next = res?.meta?.next_token;
       token = typeof next === "string" && next ? next : undefined;
@@ -173,10 +197,11 @@ export class XApiClient {
     }
 
     return {
-      data: collected.slice(0, opts.maxItems),
+      data: collected,
       pages,
       ...(nextToken ? { nextToken } : {}),
       includes,
+      errors,
     };
   }
 

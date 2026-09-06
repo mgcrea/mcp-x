@@ -1,27 +1,35 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 
-import { isRecord, shapePostsResponse } from "#/client/shape";
+import { isRecord } from "#/client/shape";
 import type { XApiClient } from "#/client/x";
 import type { ToolContext } from "#/tools/index";
 import {
   assertWithinBudget,
   compact,
+  finishPostPage,
   maxResultsArg,
   paginationTokenArg,
   POST_QUERY,
-  recordResultCost,
   stripAt,
   wrap,
 } from "#/tools/util";
 
+/**
+ * X caps a query at 512 characters on the Basic and Pro tiers and 1024 on
+ * Enterprise. The builder validates against the lower bound, because a query
+ * called valid here and refused by X is the worse of the two mistakes.
+ */
+export const MAX_QUERY_LENGTH = 512;
+const MAX_QUERY_LENGTH_ENTERPRISE = 1024;
+
 const queryArg = z
   .string()
   .min(1)
-  .max(1024)
+  .max(MAX_QUERY_LENGTH_ENTERPRISE)
   .describe(
     'An X search query, e.g. "rust -is:retweet lang:en". Build one with x_build_search_query if ' +
-      "you are unsure of the operators.",
+      `you are unsure of the operators. At most ${MAX_QUERY_LENGTH} characters on Basic and Pro.`,
   );
 
 const timeArgs = {
@@ -30,6 +38,25 @@ const timeArgs = {
     .optional()
     .describe('Only posts at or after this ISO-8601 UTC time, e.g. "2026-07-01T00:00:00Z".'),
   endTime: z.string().optional().describe("Only posts before this ISO-8601 UTC time."),
+};
+
+/** The filters recent and full-archive search share, described once. */
+const searchFilterArgs = {
+  sortOrder: z
+    .enum(["recency", "relevancy"])
+    .optional()
+    .describe("`recency` (newest first, the default) or `relevancy`."),
+  ...timeArgs,
+  sinceId: z
+    .string()
+    .regex(/^\d+$/)
+    .optional()
+    .describe('Only posts newer than this post id, e.g. "1799000000000000001".'),
+  untilId: z
+    .string()
+    .regex(/^\d+$/)
+    .optional()
+    .describe('Only posts older than this post id, e.g. "1799000000000000001".'),
 };
 
 /**
@@ -80,7 +107,7 @@ export const registerQueryBuilderTool = (server: McpServer): void => {
           .describe("true to require reposts, false to exclude them. False is the usual choice."),
         isQuote: z.boolean().optional().describe("true to require quote posts, false to exclude."),
       }),
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async (args) => wrap(async () => buildSearchQuery(args)),
   );
@@ -116,8 +143,9 @@ export const registerSearchTools = (
       compact({
         query: args.query,
         // X requires max_results between 10 and 100 on search, so a request for
-        // 3 becomes a request for 10 that we then truncate. Billing follows what
-        // came back, so this is honest about what it costs.
+        // 3 becomes a request for 10. X bills all 10, so all 10 are returned and
+        // billed here — trimming to 3 would waste seven paid posts and make the
+        // next_token skip them.
         max_results: Math.min(Math.max(args.maxResults, 10), 100),
         sort_order: args.sortOrder,
         start_time: args.startTime,
@@ -130,18 +158,7 @@ export const registerSearchTools = (
       { maxItems: args.maxResults, maxPages: 5 },
     );
 
-    const shaped = shapePostsResponse({ data: res.data, includes: res.includes[0] ?? {} });
-    return {
-      query: args.query,
-      posts: shaped.posts,
-      result_count: shaped.posts.length,
-      ...(res.nextToken ? { next_token: res.nextToken } : {}),
-      cost: recordResultCost(
-        ctx,
-        "post",
-        shaped.posts.map((p) => p.id),
-      ),
-    };
+    return { query: args.query, ...finishPostPage(ctx, "post", res) };
   };
 
   server.registerTool(
@@ -155,14 +172,8 @@ export const registerSearchTools = (
         "Run x_count_recent first to see how big a query is before paying to read it.",
       inputSchema: z.object({
         query: queryArg,
-        maxResults: maxResultsArg,
-        sortOrder: z
-          .enum(["recency", "relevancy"])
-          .optional()
-          .describe("`recency` (newest first, the default) or `relevancy`."),
-        ...timeArgs,
-        sinceId: z.string().regex(/^\d+$/).optional().describe("Only posts newer than this id."),
-        untilId: z.string().regex(/^\d+$/).optional().describe("Only posts older than this id."),
+        maxResults: maxResultsArg(ctx.defaultMaxResults),
+        ...searchFilterArgs,
         paginationToken: paginationTokenArg,
       }),
       annotations: { readOnlyHint: true },
@@ -183,24 +194,50 @@ export const registerSearchTools = (
         granularity: z
           .enum(["minute", "hour", "day"])
           .default("day")
-          .describe("Bucket size for the time series. Defaults to day."),
+          .describe(
+            "Bucket size for the time series. Defaults to day. Note that `minute` over the " +
+              "full 7-day window is about 10,000 buckets, so pair it with a time window.",
+          ),
         ...timeArgs,
+        maxBuckets: z
+          .number()
+          .int()
+          .min(1)
+          .max(10_080)
+          .default(200)
+          .describe(
+            "How many time buckets to return, newest first. The total is always complete; " +
+              "this only bounds the series. Defaults to 200.",
+          ),
+        paginationToken: paginationTokenArg,
       }),
       annotations: { readOnlyHint: true },
     },
-    async ({ query, granularity, startTime, endTime }) =>
+    async ({ query, granularity, startTime, endTime, maxBuckets, paginationToken }) =>
       wrap(async () => {
         const raw = await client.get(
           "/2/tweets/counts/recent",
-          compact({ query, granularity, start_time: startTime, end_time: endTime }),
+          compact({
+            query,
+            granularity,
+            start_time: startTime,
+            end_time: endTime,
+            next_token: paginationToken,
+          }),
         );
         const meta = isRecord(raw) && isRecord(raw.meta) ? raw.meta : {};
         const total = typeof meta.total_tweet_count === "number" ? meta.total_tweet_count : 0;
         const estimated = ctx.ledger.estimateCount("post", total);
+        const buckets = isRecord(raw) && Array.isArray(raw.data) ? raw.data : [];
         return {
           query,
           total_posts: total,
-          buckets: isRecord(raw) && Array.isArray(raw.data) ? raw.data : [],
+          buckets: buckets.slice(0, maxBuckets),
+          bucket_count: buckets.length,
+          ...(buckets.length > maxBuckets ? { buckets_truncated: true } : {}),
+          ...(typeof meta.next_token === "string" && meta.next_token
+            ? { next_token: meta.next_token }
+            : {}),
           cost: { estimated_usd: 0, note: "Counts are not billed per post." },
           reading_all_would_cost_usd: Math.round(estimated * 100) / 100,
           ...(total > 100
@@ -231,11 +268,8 @@ export const registerSearchTools = (
         "slower than x_search_recent. Same query syntax. Costs the same per post read.",
       inputSchema: z.object({
         query: queryArg,
-        maxResults: maxResultsArg,
-        sortOrder: z.enum(["recency", "relevancy"]).optional(),
-        ...timeArgs,
-        sinceId: z.string().regex(/^\d+$/).optional(),
-        untilId: z.string().regex(/^\d+$/).optional(),
+        maxResults: maxResultsArg(ctx.defaultMaxResults),
+        ...searchFilterArgs,
         paginationToken: paginationTokenArg,
       }),
       annotations: { readOnlyHint: true },
@@ -272,6 +306,18 @@ const orGroup = (operator: string, values: string[]): string =>
     ? `${operator}:${values[0]}`
     : `(${values.map((v) => `${operator}:${v}`).join(" OR ")})`;
 
+/**
+ * X's query language has no escape for a literal double quote, so one inside a
+ * term is dropped rather than passed through to break the whole query.
+ */
+const unquoted = (value: string): string => value.trim().replace(/"/g, "");
+
+/** A term X would otherwise split on whitespace is quoted so it stays one term. */
+const term = (value: string): string => {
+  const clean = unquoted(value);
+  return /\s/.test(clean) ? `"${clean}"` : clean;
+};
+
 export const buildSearchQuery = (
   parts: QueryParts,
 ): { query: string; explanation: string[]; length: number; valid: boolean; warning?: string } => {
@@ -282,17 +328,22 @@ export const buildSearchQuery = (
     clauses.push(parts.allWords.trim());
     explanation.push(`\`${parts.allWords.trim()}\` — all of these words must appear.`);
   }
-  if (parts.exactPhrase?.trim()) {
-    clauses.push(`"${parts.exactPhrase.trim()}"`);
-    explanation.push(`\`"${parts.exactPhrase.trim()}"\` — this exact phrase must appear.`);
+  if (unquoted(parts.exactPhrase ?? "")) {
+    const phrase = `"${unquoted(parts.exactPhrase ?? "")}"`;
+    clauses.push(phrase);
+    explanation.push(`\`${phrase}\` — this exact phrase must appear.`);
   }
-  if (parts.anyWords?.length) {
-    clauses.push(`(${parts.anyWords.join(" OR ")})`);
-    explanation.push(`\`(${parts.anyWords.join(" OR ")})\` — at least one of these must appear.`);
+  const anyWords = (parts.anyWords ?? []).map(term).filter(Boolean);
+  if (anyWords.length > 0) {
+    const group = anyWords.length === 1 ? anyWords[0] : `(${anyWords.join(" OR ")})`;
+    clauses.push(group as string);
+    explanation.push(`\`${group}\` — at least one of these must appear.`);
   }
-  for (const word of parts.noneWords ?? []) {
+  for (const word of (parts.noneWords ?? []).map(term).filter(Boolean)) {
+    // Quoted when multi-word: `-machine learning` excludes "machine" and then
+    // *requires* "learning", which is the opposite of what was asked.
     clauses.push(`-${word}`);
-    explanation.push(`\`-${word}\` — excludes posts containing "${word}".`);
+    explanation.push(`\`-${word}\` — excludes posts containing ${word}.`);
   }
   for (const tag of parts.hashtags ?? []) {
     const clean = tag.startsWith("#") ? tag : `#${tag}`;
@@ -353,10 +404,14 @@ export const buildSearchQuery = (
     query,
     explanation,
     length: query.length,
-    valid: query.length > 0 && query.length <= 1024,
+    valid: query.length > 0 && query.length <= MAX_QUERY_LENGTH,
     ...(query.length === 0 ? { warning: "No criteria given — the query is empty." } : {}),
-    ...(query.length > 1024
-      ? { warning: `Query is ${query.length} characters; X's limit is 1024.` }
+    ...(query.length > MAX_QUERY_LENGTH
+      ? {
+          warning:
+            `Query is ${query.length} characters; X's limit is ${MAX_QUERY_LENGTH} on Basic and ` +
+            `Pro (${MAX_QUERY_LENGTH_ENTERPRISE} on Enterprise).`,
+        }
       : {}),
   };
 };

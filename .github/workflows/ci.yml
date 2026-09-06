@@ -12,13 +12,20 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# The default for every job. `test` runs the dependency tree's lifecycle
+# scripts, in the same workflow as a job holding id-token: write; it must not
+# inherit a repository default that may be read/write on contents.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Test on node@${{ matrix.node }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node: ["lts/*"]
+        # engines.node says >=22, so the floor is tested, not just claimed.
+        node: ["22", "lts/*"]
     steps:
       - name: Checkout 🛎️
         uses: actions/checkout@v5
@@ -61,21 +68,65 @@ jobs:
               process.exit(1);
             }
           "
+      - name: Package is publishable 🔍
+        run: |
+          node -e '
+            const pkg = require("./package.json");
+            if (pkg.private) {
+              console.error("package.json has \"private\": true — npm publish and the release job will both refuse it.");
+              process.exit(1);
+            }
+            if (!pkg.publishConfig || pkg.publishConfig.access !== "public") {
+              console.error("a scoped package needs publishConfig.access = \"public\".");
+              process.exit(1);
+            }
+            console.log(`publishable: ${pkg.name}@${pkg.version}`);
+          '
+
       # The tool list is the server's public contract, and it is easy to change
-      # by accident. This asserts the built CLI still speaks MCP over stdio and
-      # still exposes the free compose path with nothing but a fake token.
+      # by accident. Three phases against the BUILT cli, because unit tests
+      # cannot see a bundle that no longer starts or a `bin` pointing at nothing:
+      #   1. no configuration at all — the server must still answer tools/list
+      #      with exactly the free tools (a server that exits here shows in the
+      #      client as "Connection closed" with stderr swallowed);
+      #   2. credentialled but every gate off — reads present, writes and ads absent;
+      #   3. gates on — the write tools appear, which is the positive check the
+      #      second phase cannot make (it keeps passing after every write tool
+      #      is renamed away).
+      # HOME=/nonexistent so the runner's own config directory is never read.
       - name: MCP smoke test 🧪
         run: |
-          printf '%s\n' \
-            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
-            '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-          | X_CONFIG=/nonexistent.json X_BEARER_TOKEN=ci-fake node dist/cli.js 2>/dev/null \
-          > /tmp/tools.json
-          grep -q 'x_compose_post' /tmp/tools.json || { echo "MCP smoke test failed"; exit 1; }
-          # The negative half of the same promise: a capability that was not
-          # configured must not merely refuse, it must not be registered.
-          ! grep -q 'x_ads_' /tmp/tools.json || { echo "ads tools leaked without X_ADS_ENABLED"; exit 1; }
+          list() {
+            printf '%s\n' \
+              '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
+              '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+              '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+            | env -i PATH="$PATH" HOME=/nonexistent "$@" node dist/cli.js 2>/dev/null \
+            | grep -o '"name":"x_[a-z_]*"' | sort -u | tr -d '"' | sed 's/name://'
+          }
+          list > /tmp/phase1.txt
+          expected='x_build_search_query
+          x_compose_post
+          x_get_auth_status
+          x_validate_post'
+          diff <(echo "$expected" | sed 's/^ *//') /tmp/phase1.txt \
+            || { echo "phase 1: unconfigured server did not expose exactly the free tools"; exit 1; }
+
+          list X_BEARER_TOKEN=ci-fake > /tmp/phase2.txt
+          grep -qx 'x_get_post' /tmp/phase2.txt || { echo "phase 2: read tools missing"; exit 1; }
+          ! grep -q 'x_create_post\|x_delete_post' /tmp/phase2.txt || { echo "phase 2: paid writes leaked"; exit 1; }
+          ! grep -q 'x_ads_' /tmp/phase2.txt || { echo "phase 2: ads tools leaked"; exit 1; }
+          ! grep -q 'x_login' /tmp/phase2.txt || { echo "phase 2: login leaked without a client id"; exit 1; }
+
+          list X_BEARER_TOKEN=ci-fake X_CLIENT_ID=ci X_ALLOW_WRITES=1 X_WRITE_BACKEND=api > /tmp/phase3.txt
+          grep -qx 'x_create_post' /tmp/phase3.txt || { echo "phase 3: paid writes did not register"; exit 1; }
+          grep -qx 'x_login' /tmp/phase3.txt || { echo "phase 3: login did not register"; exit 1; }
+
+          # A contradiction between flags must degrade, never exit: this once
+          # took the whole server down with the explanation swallowed.
+          list X_ADS_ENABLED=1 > /tmp/phase4.txt
+          diff /tmp/phase1.txt /tmp/phase4.txt \
+            || { echo "phase 4: a misconfigured flag changed the tool list or killed the server"; exit 1; }
 
   publish-npm:
     name: Publish to npm

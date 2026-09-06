@@ -3,12 +3,9 @@ import type { OAuthClient } from "#/client/oauth";
 import { toStoredTokens } from "#/client/oauth";
 import type { StoredTokens, TokenStore } from "#/client/tokens";
 import { tokensAreStale } from "#/client/tokens";
+import type { Logger } from "#/logger";
 
-export type Logger = {
-  debug?: (message: string) => void;
-  warn?: (message: string) => void;
-  error?: (message: string) => void;
-};
+export type { Logger } from "#/logger";
 
 /**
  * X has two credentials that are not interchangeable, so every request has to
@@ -42,9 +39,14 @@ export type AuthStatus = {
 export type TokenProvider = {
   /** Bearer value for the requested context. Throws `UserContextRequiredError` if unavailable. */
   getToken(context: AuthContext): Promise<string>;
-  /** Called on a 401 to force the next call to remint or refresh. */
-  invalidate(context: AuthContext): void;
-  /** Powers `x_auth_status` and the startup banner. */
+  /**
+   * Called on a 401 to force the next call to remint or refresh. Returns
+   * whether that is possible at all: an app-only Bearer token cannot be
+   * reminted, and saying so lets the retry loop stop instead of re-sending
+   * the same rejected string.
+   */
+  invalidate(context: AuthContext): boolean;
+  /** Powers `x_get_auth_status` and the startup banner. */
   describe(): AuthStatus;
 };
 
@@ -64,7 +66,7 @@ export const bearerTokenProvider = (token: string): TokenProvider => ({
     }
     return token;
   },
-  invalidate: () => {},
+  invalidate: () => false,
   describe: () => ({
     app: true,
     user: { authenticated: false, reason: "no OAuth2 client id configured" },
@@ -85,9 +87,10 @@ export const bearerTokenProvider = (token: string): TokenProvider => ({
  *     crash-between-response-and-write window rather than dumping the user back
  *     into a browser.
  *
- * A single in-flight promise coordinates concurrent callers: unlike a locally
- * signed JWT, an OAuth refresh is a network call that must not be issued twice
- * — the second would present a token the first had just invalidated.
+ * A single in-flight promise coordinates concurrent callers, whichever context
+ * they ask for: unlike a locally signed JWT, an OAuth refresh is a network call
+ * that must not be issued twice — the second would present a token the first
+ * had just invalidated.
  */
 export const userTokenProvider = (opts: {
   store: TokenStore;
@@ -155,12 +158,10 @@ export const userTokenProvider = (opts: {
   };
 
   return {
-    getToken: async (context) => {
-      if (context === "app") {
-        // An OAuth2 user token can read everything an app-only token can, so
-        // serving app-context reads from it is correct, not a fallback hack.
-        return resolve();
-      }
+    // An OAuth2 user token can read everything an app-only token can, so
+    // serving app-context reads from it is correct, not a fallback hack — and
+    // both contexts share the one in-flight refresh.
+    getToken: async () => {
       if (!inFlight) {
         inFlight = resolve().finally(() => {
           inFlight = undefined;
@@ -173,6 +174,7 @@ export const userTokenProvider = (opts: {
       const tokens = opts.store.read();
       if (tokens) opts.store.write({ ...tokens, expiresAt: 0 });
       inFlight = undefined;
+      return true;
     },
     describe: () => {
       const tokens = opts.store.read();
@@ -221,8 +223,11 @@ export const compositeTokenProvider = (parts: {
     );
   },
   invalidate: (context) => {
-    if (context === "user") parts.user?.invalidate("user");
-    else parts.app?.invalidate("app");
+    if (context === "user") return parts.user?.invalidate("user") ?? false;
+    // Mirror of getToken: app-context reads served by the user token are
+    // invalidated there, and a Bearer token cannot be invalidated at all.
+    if (parts.app) return parts.app.invalidate("app");
+    return parts.user?.invalidate("user") ?? false;
   },
   describe: () => ({
     app: parts.app?.describe().app ?? false,
@@ -236,7 +241,7 @@ export const compositeTokenProvider = (parts: {
 /** The test double: one token, both contexts, no network. */
 export const staticTokenProvider = (token: string): TokenProvider => ({
   getToken: async () => token,
-  invalidate: () => {},
+  invalidate: () => true,
   describe: () => ({
     app: true,
     user: { authenticated: true, username: "test", userId: "1", scopes: [], expiresAt: 0 },

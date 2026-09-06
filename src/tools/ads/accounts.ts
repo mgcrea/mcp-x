@@ -41,7 +41,7 @@ export const registerAdsAccountTools = (
           { maxItems: count },
         );
         return {
-          accounts: page.data,
+          accounts: shapeAds({ data: page.data }),
           environment: ads.sandbox ? "sandbox" : "production",
           ...(page.nextCursor ? { next_cursor: page.nextCursor } : {}),
           cost: adsCostNote(),
@@ -79,7 +79,9 @@ export const registerAdsAccountTools = (
 
   // Sandbox only: on production these entities are created by X, not by callers,
   // and offering the tool anywhere else would be offering a guaranteed failure.
-  if (!ads.sandbox) return;
+  // It also creates something, so it sits behind the same write gate as every
+  // other creating tool — a read-only sandbox profile gets no creating tools.
+  if (!ads.sandbox || !ads.allowWrites) return;
 
   server.registerTool(
     "x_ads_create_sandbox_account",
@@ -88,7 +90,8 @@ export const registerAdsAccountTools = (
       description:
         "Create a throwaway ads account in the sandbox, complete with a funding instrument, so " +
         "the campaign tools can be exercised without spending anything. Sandbox only — this tool " +
-        "is not registered against production.",
+        "is not registered against production, and needs X_ADS_ALLOW_WRITES like every other " +
+        "creating tool.",
       inputSchema: z.object({}),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },

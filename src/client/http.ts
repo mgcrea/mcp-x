@@ -1,4 +1,21 @@
 import type { Logger } from "#/client/auth";
+import { RequestTimeoutError } from "#/client/errors";
+
+/**
+ * How long one HTTP round trip may take before it is abandoned. A stalled
+ * connection would otherwise hang the tool call forever: the MCP client gives
+ * up on its side with no server-side cancellation, and the retry loop never
+ * advances. Thirty seconds is well past anything X answers in normally.
+ */
+export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+
+/**
+ * The longest a 429 or 5xx is waited out inside a tool call. X's v2 windows
+ * are 15 minutes and `Retry-After` says so honestly; sleeping for it would look
+ * exactly like a hung server, and could stack to `maxRetries` × 15 min. Past
+ * this the 429 is returned at once with the reset time in its message.
+ */
+export const MAX_RETRY_WAIT_MS = 30_000;
 
 export type QueryValue = string | number | boolean | string[] | undefined;
 export type Query = Record<string, QueryValue>;
@@ -31,11 +48,38 @@ export const sleep = (ms: number): Promise<void> =>
 
 export const backoffMs = (attempt: number): number => Math.min(1000 * 2 ** attempt, 8000);
 
-export const retryAfterMs = (res: Response): number | undefined => {
+export const retryAfterMs = (res: Response, now: number = Date.now()): number | undefined => {
   const header = res.headers.get("Retry-After");
-  if (header === null) return undefined;
-  const seconds = Number(header);
-  return Number.isFinite(seconds) ? Math.max(seconds, 0) * 1000 : undefined;
+  if (header !== null) {
+    const seconds = Number(header);
+    if (Number.isFinite(seconds)) return Math.max(seconds, 0) * 1000;
+  }
+  // X rarely sends Retry-After; it reports the window end as unix seconds.
+  const reset = numberOrUndefined(res.headers.get("x-rate-limit-reset"));
+  if (reset !== undefined) return Math.max(reset * 1000 - now, 0);
+  return undefined;
+};
+
+/**
+ * `fetch` with a deadline, and the abort translated into an error that names
+ * the request rather than a bare "This operation was aborted".
+ */
+export const fetchWithTimeout = async (
+  fetchImpl: typeof fetch,
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+  label: string,
+): Promise<Response> => {
+  try {
+    return await fetchImpl(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  } catch (err) {
+    const name = (err as { name?: unknown }).name;
+    if (name === "TimeoutError" || name === "AbortError") {
+      throw new RequestTimeoutError(label, timeoutMs);
+    }
+    throw err;
+  }
 };
 
 export const safeJsonParse = (text: string): unknown => {
@@ -79,13 +123,24 @@ export const buildQuery = (query: Query | undefined): string => {
  * new entry per post.
  */
 export const endpointKey = (method: string, path: string): string =>
-  `${method} ${path.replace(/\/\d{5,}/g, "/:id").replace(/\?.*$/, "")}`;
+  `${method} ${path
+    .replace(/\/\d{5,}/g, "/:id")
+    // Handles are not digits, and without this every profile looked up by
+    // name is its own bucket — a map that grows for the life of the process.
+    .replace(/\/by\/username\/[^/?]+/, "/by/username/:username")
+    .replace(/\?.*$/, "")}`;
 
 export type RetryPolicy = {
   maxRetries: number;
   label: string;
   logger?: Logger | undefined;
-  onUnauthorized?: (() => void) | undefined;
+  /**
+   * Called on a 401. Returns whether the next attempt will carry a different
+   * credential; `false` ends the retries, because re-sending the same rejected
+   * token `maxRetries` times only burns the budget and the user's time.
+   */
+  onUnauthorized?: (() => boolean | void) | undefined;
+  maxWaitMs?: number | undefined;
 };
 
 /** Run `perform` until it yields a non-retryable response or the budget runs out. */
@@ -94,20 +149,27 @@ export const withRetry = async (
   policy: RetryPolicy,
 ): Promise<Response> => {
   let attempt = 0;
+  const maxWait = policy.maxWaitMs ?? MAX_RETRY_WAIT_MS;
 
   for (;;) {
     policy.logger?.debug?.(`[x] ${policy.label} (attempt ${attempt + 1})`);
     const res = await perform();
 
     if (res.status === 401 && policy.onUnauthorized && attempt < policy.maxRetries) {
+      if (policy.onUnauthorized() === false) return res;
       policy.logger?.warn?.(`[x] HTTP 401 — refreshing token and retrying`);
-      policy.onUnauthorized();
       attempt += 1;
       continue;
     }
 
     if ((res.status === 429 || res.status >= 500) && attempt < policy.maxRetries) {
       const delay = retryAfterMs(res) ?? backoffMs(attempt);
+      if (delay > maxWait) {
+        policy.logger?.warn?.(
+          `[x] HTTP ${res.status} — the window resets in ${Math.round(delay / 1000)}s, not waiting`,
+        );
+        return res;
+      }
       policy.logger?.warn?.(`[x] HTTP ${res.status} — retrying in ${delay}ms`);
       await sleep(delay);
       attempt += 1;

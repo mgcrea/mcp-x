@@ -316,16 +316,28 @@ describe("buildIncludesIndex", () => {
 
 describe("shapePaginatedPosts", () => {
   it("resolves authors across page boundaries", () => {
-    const res = shapePaginatedPosts(
-      [
+    const res = shapePaginatedPosts({
+      data: [
         { id: "1", text: "page one", author_id: "u2" },
         { id: "2", text: "page two", author_id: "u1" },
       ],
-      [{ users: [{ id: "u1", username: "first" }] }, { users: [{ id: "u2", username: "second" }] }],
-      "cursor",
-    );
+      includes: [
+        { users: [{ id: "u1", username: "first" }] },
+        { users: [{ id: "u2", username: "second" }] },
+      ],
+      nextToken: "cursor",
+    });
     expect(res.posts[0]?.author).toBe("@second");
     expect(res.posts[1]?.author).toBe("@first");
     expect(res.next_token).toBe("cursor");
+  });
+
+  it("reports ids X refused across pages as not_found", () => {
+    const res = shapePaginatedPosts({
+      data: [{ id: "1", text: "kept" }],
+      includes: [],
+      errors: [{ value: "7", resource_type: "tweet" }, { resource_id: "8" }],
+    });
+    expect(res.not_found).toEqual(["7", "8"]);
   });
 });

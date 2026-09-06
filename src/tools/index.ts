@@ -11,6 +11,7 @@ import { registerAdsTools } from "#/tools/ads/index";
 import { registerAuthTools } from "#/tools/auth";
 import { registerComposeTools } from "#/tools/compose";
 import { registerPostTools } from "#/tools/posts";
+import { registerRequestTool } from "#/tools/request";
 import { registerQueryBuilderTool, registerSearchTools } from "#/tools/search";
 import { registerTimelineTools } from "#/tools/timelines";
 import { registerUsageTools } from "#/tools/usage";
@@ -57,9 +58,17 @@ export type ToolContext = {
    * would call the X API are simply not registered.
    */
   hasCredentials: boolean;
-  /** Setup guidance surfaced by x_auth_status when nothing is configured. */
+  /** Setup guidance surfaced by x_get_auth_status when nothing is configured. */
   setup?: string[] | undefined;
-  /** Where the OAuth tokens live, for x_auth_status. Absent when OAuth is unconfigured. */
+  /** Misconfigurations `loadConfig` switched off rather than died over. */
+  warnings: string[];
+  /**
+   * The OAuth callback URL in force. Surfaced by x_get_auth_status because under
+   * a supervisor the port is assigned per profile, and the user has to
+   * register that exact URL with the X app before a login can succeed.
+   */
+  redirectUri: string;
+  /** Where the OAuth tokens live, for x_get_auth_status. Absent when OAuth is unconfigured. */
   tokenFile?: string | undefined;
   /**
    * The token file, so a user id discovered lazily can be written back and not
@@ -71,7 +80,7 @@ export type ToolContext = {
   logout?: (() => void) | undefined;
   /** Present only when X_ADS_ENABLED is on and an OAuth client id is configured. */
   ads?: AdsContext | undefined;
-  /** Ads setup guidance surfaced by x_auth_status when ads is not configured. */
+  /** Ads setup guidance surfaced by x_get_auth_status when ads is not configured. */
   adsSetup?: string[] | undefined;
 };
 
@@ -115,4 +124,7 @@ export const registerTools = (server: McpServer, client: XApiClient, ctx: ToolCo
     // token cannot reach /12/accounts at all.
     if (ctx.ads) registerAdsTools(server, ctx.ads.client, ctx);
   }
+  // Last, so its method enum can see every gate above: it widens past GET only
+  // when a write gate is on, and it is never registered without credentials.
+  registerRequestTool(server, client, ctx);
 };

@@ -15,7 +15,7 @@ export const adsCostNote = (): { estimated_usd: number; note: string } => ({
   estimated_usd: 0,
   note:
     "Ads API calls are not billed under X's pay-per-use read pricing, so this costs nothing and " +
-    "does not appear in x_usage_report. The campaigns it manages spend your advertising budget.",
+    "does not appear in x_get_usage_report. The campaigns it manages spend your advertising budget.",
 });
 
 export const accountIdArg = z
@@ -120,7 +120,7 @@ export const createAccountResolver = (
         "The logged-in account has access to no ads accounts, so there is nothing to act on. " +
           "Either this X user has not been granted a role on an ads account (that is done in " +
           "ads.x.com, not the developer console), or the app is not approved for the Ads API " +
-          "yet. Check x_auth_status for the setup steps." +
+          "yet. Check x_get_auth_status for the setup steps." +
           (ads.sandbox ? " In the sandbox, call x_ads_create_sandbox_account to make one." : ""),
         { baseUrl: ads.baseUrl, sandbox: ads.sandbox },
       );

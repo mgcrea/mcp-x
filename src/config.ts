@@ -4,6 +4,8 @@ import { dirname, join } from "node:path";
 
 import { z } from "zod";
 
+import type { Logger } from "#/logger";
+
 export const DEFAULT_BASE_URL = "https://api.x.com";
 
 export const DEFAULT_ADS_BASE_URL = "https://ads-api.x.com";
@@ -92,49 +94,20 @@ const ConfigSchema = z
     adsAccountId: z.string().min(1).optional(),
     adsMaxDownloadBytes: z.number().int().positive().default(25_000_000),
   })
-  .strict()
-  .superRefine((cfg, ctx) => {
-    // Deliberately NOT an error when no credentials are set. An MCP server that
-    // exits on startup shows up in the client as a bare "Connection closed",
-    // with stderr swallowed — so the one message that would have explained the
-    // problem never reaches anyone. Worse, it makes the free tools
-    // (x_compose_post, x_validate_post, x_build_search_query) unreachable even
-    // though they need no credentials at all, and leaves no way to discover
-    // that OAuth needs X_CLIENT_ID. The server starts; `x_auth_status`
-    // and the startup banner report what is missing.
-    if (cfg.writeBackend === "api" && !cfg.clientId) {
-      ctx.addIssue({
-        code: "custom",
-        message:
-          "X_WRITE_BACKEND=api needs a user context: set X_CLIENT_ID and run " +
-          "`x-mcp login`. The default backend (intent) needs no credentials at all — it " +
-          "returns an x.com/intent/tweet URL you click, which costs nothing.",
-      });
-    }
+  .strict();
 
-    // The Ads API is user-context only: an app-only Bearer token cannot reach
-    // /12/accounts at all. Saying so here is much cheaper than letting every
-    // ads call fail with an auth error that reads like a bad token.
-    if (cfg.adsEnabled && !cfg.clientId) {
-      ctx.addIssue({
-        code: "custom",
-        message:
-          "X_ADS_ENABLED=1 needs an OAuth 2.0 user context: set X_CLIENT_ID and run " +
-          "`x-mcp login`. The Ads API does not accept an app-only Bearer token.",
-      });
-    }
-
-    if (cfg.adsAllowWrites && !cfg.adsEnabled) {
-      ctx.addIssue({
-        code: "custom",
-        message:
-          "X_ADS_ALLOW_WRITES=1 has no effect without X_ADS_ENABLED=1 — the ads tools are not " +
-          "registered at all. Set both, or neither.",
-      });
-    }
-  });
-
-export type Config = z.infer<typeof ConfigSchema>;
+/**
+ * The resolved configuration plus everything `loadConfig` had to say about it.
+ *
+ * `warnings` is the channel for a misconfiguration that is *not* worth dying
+ * over. The server once threw on three of them (the paid write backend
+ * without a client id, ads without a client id, ads writes without ads) and
+ * every one surfaced in the client as a bare "Connection closed" with the
+ * explanation swallowed — the same failure the missing-credentials case had
+ * already been cured of. Now the offending flag is switched off, the reason is
+ * recorded here, and the banner and `x_get_auth_status` both print it.
+ */
+export type Config = z.infer<typeof ConfigSchema> & { warnings: string[] };
 
 /**
  * The on-disk config document. Keys are camelCase to mirror `Config` rather than
@@ -173,22 +146,59 @@ const FileConfigSchema = z
 
 export type FileConfig = z.infer<typeof FileConfigSchema>;
 
-const parseBool = (value: string | undefined): boolean | undefined => {
+const TRUE_WORDS = ["1", "true", "yes", "on"];
+const FALSE_WORDS = ["0", "false", "no", "off"];
+
+/**
+ * Parsers that report rather than swallow. `X_MONTHLY_BUDGET_USD=25usd`
+ * silently meaning "no budget" is a spend ceiling the user believes is there
+ * and is not; each of these hands the offending value to `warn` instead.
+ */
+type Warn = (message: string) => void;
+
+const parseBool = (name: string, value: string | undefined, warn: Warn): boolean | undefined => {
   const t = trimmed(value);
   if (t === undefined) return undefined;
-  return ["1", "true", "yes", "on"].includes(t.toLowerCase());
+  const word = t.toLowerCase();
+  if (TRUE_WORDS.includes(word)) return true;
+  if (!FALSE_WORDS.includes(word)) {
+    warn(
+      `${name}="${t}" is not a recognised boolean (use 1/0, true/false, yes/no, on/off); treated as off.`,
+    );
+  }
+  return false;
 };
 
-const parseIntOpt = (value: string | undefined): number | undefined => {
-  if (value === undefined || value.trim() === "") return undefined;
-  const n = Number(value);
-  return Number.isInteger(n) ? n : undefined;
+const parseIntOpt = (name: string, value: string | undefined, warn: Warn): number | undefined => {
+  const t = trimmed(value);
+  if (t === undefined) return undefined;
+  const n = Number(t);
+  if (Number.isInteger(n)) return n;
+  warn(`${name}="${t}" is not a whole number; ignored.`);
+  return undefined;
 };
 
-const parseFloatOpt = (value: string | undefined): number | undefined => {
-  if (value === undefined || value.trim() === "") return undefined;
-  const n = Number(value);
-  return Number.isFinite(n) ? n : undefined;
+const parseFloatOpt = (name: string, value: string | undefined, warn: Warn): number | undefined => {
+  const t = trimmed(value);
+  if (t === undefined) return undefined;
+  const n = Number(t);
+  if (Number.isFinite(n)) return n;
+  warn(`${name}="${t}" is not a number; ignored.`);
+  return undefined;
+};
+
+/** A JSON object in an env var, for the one structured setting (`pricing`). */
+const parseJsonObject = (name: string, value: string | undefined, warn: Warn): unknown => {
+  const t = trimmed(value);
+  if (t === undefined) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(t);
+    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) return parsed;
+    warn(`${name} must be a JSON object; ignored.`);
+  } catch (err) {
+    warn(`${name} is not valid JSON (${message(err)}); ignored.`);
+  }
+  return undefined;
 };
 
 /** Scopes are space-separated in OAuth but commas are what people actually type. */
@@ -233,11 +243,11 @@ export const resolveTokenPath = (env: NodeJS.ProcessEnv = process.env): string =
  * other users is worth saying out loud. It is a warning and not an error:
  * refusing to start would be a worse trade for someone on a single-user machine.
  */
-export const warnIfGroupReadable = (path: string): void => {
+export const warnIfGroupReadable = (path: string, logger?: Logger): void => {
   if (process.platform === "win32") return; // mode bits mean nothing here
   try {
     if (statSync(path).mode & 0o077) {
-      process.stderr.write(`[x] ${path} is readable by other users. Run: chmod 600 ${path}\n`);
+      logger?.warn?.(`[x] ${path} is readable by other users. Run: chmod 600 ${path}`);
     }
   } catch {
     // Not worth failing startup over; the read below reports anything that matters.
@@ -250,7 +260,7 @@ export const warnIfGroupReadable = (path: string): void => {
  * a missing one — that confusion would send you hunting for credentials that
  * were sitting right there.
  */
-const readConfigFile = (path: string): FileConfig => {
+const readConfigFile = (path: string, logger?: Logger): FileConfig => {
   let raw: string;
   try {
     raw = readFileSync(path, "utf8");
@@ -259,7 +269,7 @@ const readConfigFile = (path: string): FileConfig => {
     throw new Error(`Could not read the config file (${path}): ${message(err)}`, { cause: err });
   }
 
-  warnIfGroupReadable(path);
+  warnIfGroupReadable(path, logger);
 
   let parsed: unknown;
   try {
@@ -287,33 +297,80 @@ const readConfigFile = (path: string): FileConfig => {
 export const loadConfig = (
   env: NodeJS.ProcessEnv = process.env,
   configPath: string = resolveConfigPath(env),
+  logger?: Logger,
 ): Config => {
-  const file = readConfigFile(configPath);
+  const file = readConfigFile(configPath, logger);
+  const warnings: string[] = [];
+  const warn: Warn = (msg) => warnings.push(msg);
+  const bool = (name: string) => parseBool(name, env[name], warn);
+  const int = (name: string) => parseIntOpt(name, env[name], warn);
+  const float = (name: string) => parseFloatOpt(name, env[name], warn);
+
   const tokenFile = trimmed(env.X_TOKEN_FILE) ?? file.tokenFile ?? resolveTokenPath(env);
-  return ConfigSchema.parse({
+  const parsed = ConfigSchema.parse({
     bearerToken: trimmed(env.X_BEARER_TOKEN) ?? file.bearerToken,
     clientId: trimmed(env.X_CLIENT_ID) ?? file.clientId,
     clientSecret: trimmed(env.X_CLIENT_SECRET) ?? file.clientSecret,
     redirectUri: trimmed(env.X_REDIRECT_URI) ?? file.redirectUri,
     scopes: parseList(env.X_SCOPES) ?? file.scopes,
     tokenFile: expandTilde(tokenFile),
-    allowWrites: parseBool(env.X_ALLOW_WRITES) ?? file.allowWrites,
+    allowWrites: bool("X_ALLOW_WRITES") ?? file.allowWrites,
     writeBackend: trimmed(env.X_WRITE_BACKEND) ?? file.writeBackend,
-    autoOpenBrowser: parseBool(env.X_AUTO_OPEN_BROWSER) ?? file.autoOpenBrowser,
-    enableFullArchive: parseBool(env.X_ENABLE_FULL_ARCHIVE) ?? file.enableFullArchive,
-    defaultMaxResults: parseIntOpt(env.X_DEFAULT_MAX_RESULTS) ?? file.defaultMaxResults,
-    monthlyBudgetUsd: parseFloatOpt(env.X_MONTHLY_BUDGET_USD) ?? file.monthlyBudgetUsd,
-    cacheEnabled: parseBool(env.X_CACHE_ENABLED) ?? file.cacheEnabled,
-    cacheMaxEntries: parseIntOpt(env.X_CACHE_MAX_ENTRIES) ?? file.cacheMaxEntries,
-    maxRetries: parseIntOpt(env.X_MAX_RETRIES) ?? file.maxRetries,
+    autoOpenBrowser: bool("X_AUTO_OPEN_BROWSER") ?? file.autoOpenBrowser,
+    enableFullArchive: bool("X_ENABLE_FULL_ARCHIVE") ?? file.enableFullArchive,
+    defaultMaxResults: int("X_DEFAULT_MAX_RESULTS") ?? file.defaultMaxResults,
+    monthlyBudgetUsd: float("X_MONTHLY_BUDGET_USD") ?? file.monthlyBudgetUsd,
+    cacheEnabled: bool("X_CACHE_ENABLED") ?? file.cacheEnabled,
+    cacheMaxEntries: int("X_CACHE_MAX_ENTRIES") ?? file.cacheMaxEntries,
+    maxRetries: int("X_MAX_RETRIES") ?? file.maxRetries,
     baseUrl: trimmed(env.X_BASE_URL) ?? file.baseUrl,
-    pricing: file.pricing,
-    adsEnabled: parseBool(env.X_ADS_ENABLED) ?? file.adsEnabled,
-    adsAllowWrites: parseBool(env.X_ADS_ALLOW_WRITES) ?? file.adsAllowWrites,
+    // The one structured setting. A Docker deployment cannot mount a config
+    // file just to correct a price X changed, so it takes JSON in the env too.
+    pricing: parseJsonObject("X_PRICING", env.X_PRICING, warn) ?? file.pricing,
+    adsEnabled: bool("X_ADS_ENABLED") ?? file.adsEnabled,
+    adsAllowWrites: bool("X_ADS_ALLOW_WRITES") ?? file.adsAllowWrites,
     adsBaseUrl: trimmed(env.X_ADS_BASE_URL) ?? file.adsBaseUrl,
     adsAccountId: trimmed(env.X_ADS_ACCOUNT_ID) ?? file.adsAccountId,
-    adsMaxDownloadBytes: parseIntOpt(env.X_ADS_MAX_DOWNLOAD_BYTES) ?? file.adsMaxDownloadBytes,
+    adsMaxDownloadBytes: int("X_ADS_MAX_DOWNLOAD_BYTES") ?? file.adsMaxDownloadBytes,
   });
+
+  return { ...degrade(parsed, warn), warnings };
+};
+
+/**
+ * Switch off what cannot work, and say so, instead of refusing to start.
+ *
+ * Each of these used to be a fatal config error. They are contradictions, and
+ * the messages are still written to be read — but read they must be, and a
+ * server that exits at startup shows the client "Connection closed" and
+ * nothing else. So the flag is turned off, the free tools stay up, and the
+ * sentence lands in the banner and in `x_get_auth_status`, where it is seen.
+ */
+const degrade = (cfg: z.infer<typeof ConfigSchema>, warn: Warn): z.infer<typeof ConfigSchema> => {
+  const out = { ...cfg };
+  if (out.writeBackend === "api" && !out.clientId) {
+    warn(
+      "X_WRITE_BACKEND=api needs a user context: set X_CLIENT_ID and run `x-mcp login`. " +
+        "Falling back to the intent backend, which needs no credentials at all — it returns an " +
+        "x.com/intent/tweet URL you click, which costs nothing.",
+    );
+    out.writeBackend = "intent";
+  }
+  if (out.adsEnabled && !out.clientId) {
+    warn(
+      "X_ADS_ENABLED=1 needs an OAuth 2.0 user context: set X_CLIENT_ID and run `x-mcp login`. " +
+        "The Ads API does not accept an app-only Bearer token, so the ads tools are not registered.",
+    );
+    out.adsEnabled = false;
+  }
+  if (out.adsAllowWrites && !out.adsEnabled) {
+    warn(
+      "X_ADS_ALLOW_WRITES=1 has no effect without X_ADS_ENABLED=1 — the ads tools are not " +
+        "registered at all. Set both, or neither.",
+    );
+    out.adsAllowWrites = false;
+  }
+  return out;
 };
 
 /**
@@ -330,7 +387,7 @@ export const hasApiCredentials = (config: Config): boolean =>
   Boolean(config.bearerToken ?? config.clientId);
 
 /**
- * What to do when nothing is configured. Returned by `x_auth_status` and
+ * What to do when nothing is configured. Returned by `x_get_auth_status` and
  * printed at startup, because this is the state a first-time user lands in and
  * the server can no longer signal it by refusing to start.
  */
@@ -348,7 +405,7 @@ export const setupInstructions = (config: Config): string[] => [
     "creating the app choose Type of App = Native App: that makes it a public PKCE client with " +
     `no client secret, which is what this server expects. Register the callback URL ` +
     `${config.redirectUri} byte for byte (X's docs say to use 127.0.0.1 rather than localhost), ` +
-    "then run `x-mcp login` or call x_auth_login.",
+    "then run `x-mcp login` or call x_login.",
   "Enroll the app in the Pay-per-use package and the Production environment. An app left in the " +
     "legacy Free/Development state logs in successfully and then fails every call with 403 " +
     "client-not-enrolled.",
@@ -358,7 +415,7 @@ export const setupInstructions = (config: Config): string[] => [
 
 /**
  * What to do when ads is enabled but the account cannot reach the Ads API.
- * Surfaced by `x_auth_status`, because the two steps people miss are invisible
+ * Surfaced by `x_get_auth_status`, because the two steps people miss are invisible
  * from the error alone: the app needs the Ads Project attached, and any token
  * minted *before* approval does not carry the entitlement.
  */
@@ -374,7 +431,7 @@ export const adsSetupInstructions = (config: Config): string[] => [
   "After approval is granted, run `x-mcp login` again. A token minted before approval " +
     "does not carry the entitlement, and re-using it fails every call.",
   `Ads calls are billed separately from X's pay-per-use reads, so they do not appear in ` +
-    `x_usage_report — but the campaigns they manage spend your advertising budget.`,
+    `x_get_usage_report — but the campaigns they manage spend your advertising budget.`,
   `Point X_ADS_BASE_URL at ${SANDBOX_ADS_BASE_URL} for a free sandbox before touching a live ` +
     `account. Set X_ADS_ALLOW_WRITES=1 to register the campaign-mutating tools; without it they ` +
     `do not exist.`,

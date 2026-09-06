@@ -142,28 +142,3 @@ export const createLedger = (opts: {
     },
   };
 };
-
-/** Build the per-result cost note that every read tool attaches. */
-export const costNote = (
-  ledger: Ledger,
-  kind: ResourceKind,
-  billable: number,
-  free: number,
-  pricing: Pricing,
-): CostNote => {
-  const usd = round(billable * rate(pricing, kind));
-  const field =
-    kind === "post"
-      ? ("billable_post_reads" as const)
-      : kind === "user"
-        ? ("billable_user_reads" as const)
-        : ("owned_reads" as const);
-  return {
-    [field]: billable,
-    free_from_cache: free,
-    estimated_usd: usd,
-    ...(free > 0
-      ? { note: `${free} already read today — X does not bill those again until UTC midnight.` }
-      : {}),
-  } as CostNote;
-};

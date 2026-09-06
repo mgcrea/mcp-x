@@ -5,9 +5,9 @@ export {
   bearerTokenProvider,
   compositeTokenProvider,
   staticTokenProvider,
+  userTokenProvider,
   type AuthContext,
   type AuthStatus,
-  type Logger,
   type TokenProvider,
 } from "#/client/auth";
 export { createDayCache, utcDay, type DayCache, type ResourceKind } from "#/client/cache";
@@ -16,21 +16,24 @@ export {
   AdsAccessError,
   BudgetExceededError,
   PreconditionError,
+  RequestTimeoutError,
   UserContextRequiredError,
-  WritesDisabledError,
   XApiRequestError,
   type XApiError,
 } from "#/client/errors";
 export {
   buildIncludesIndex,
+  shapePaginatedPosts,
   shapePostResponse,
   shapePostsResponse,
   shapeUser,
   shapeUsersResponse,
+  type PostPage,
   type ShapedPost,
   type ShapedUser,
 } from "#/client/shape";
 export type { Query, RateLimitSnapshot } from "#/client/http";
+export type { Logger } from "#/logger";
 export { XApiClient, type XApiClientOptions } from "#/client/x";
 export {
   adsSetupInstructions,

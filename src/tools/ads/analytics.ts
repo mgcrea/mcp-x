@@ -2,7 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 
 import type { AdsApiClient } from "#/client/ads";
-import { isRecord } from "#/client/ads-shape";
+import { isRecord, shapeMoney } from "#/client/ads-shape";
 import { PreconditionError } from "#/client/errors";
 import { accountIdArg, adsCostNote, adsTimeArg, entityIdArg } from "#/tools/ads/util";
 import { compact, wrap } from "#/tools/util";
@@ -133,7 +133,9 @@ export const registerAdsAnalyticsTools = (
           placement,
           start_time: startTime,
           end_time: endTime,
-          stats: isRecord(raw) ? raw.data : raw,
+          // BILLING metrics arrive as `billed_charge_local_micro`; shaped so a
+          // model reads 47.5, not 47,500,000, on the one tool that reports spend.
+          stats: shapeMoney(isRecord(raw) ? raw.data : raw),
           cost: adsCostNote(),
         };
       }),
@@ -242,7 +244,7 @@ export const registerAdsAnalyticsTools = (
         const ready = jobs.filter(isRecord).filter((j) => j.status === "SUCCESS").length;
         return {
           account_id: id,
-          jobs,
+          jobs: shapeMoney(jobs),
           ready_count: ready,
           ...(jobs.length > 0 && ready === 0
             ? { note: "No job has finished yet. Poll again in a few seconds." }
@@ -289,7 +291,7 @@ export const registerAdsAnalyticsTools = (
 
         if (raw) {
           return {
-            rows: rows.slice(0, maxRows),
+            rows: shapeMoney(rows.slice(0, maxRows)),
             row_count: rows.length,
             truncated: rows.length > maxRows,
             decompressed_bytes: bytes,
@@ -314,7 +316,9 @@ export const registerAdsAnalyticsTools = (
               totals[metric] = (totals[metric] ?? 0) + sum;
             }
           }
-          return { id: row.id, segments: series.length, totals };
+          // `totals` carries `billed_charge_local_micro` when BILLING was asked
+          // for; pair it with `billed_charge` like every other money field.
+          return { id: row.id, segments: series.length, totals: shapeMoney(totals) };
         });
 
         return {

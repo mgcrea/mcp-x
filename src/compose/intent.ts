@@ -66,6 +66,8 @@ export type IntentValidation = {
   remaining: number;
   composed: string;
   intent_url: string;
+  /** The links X will shorten to t.co, each counted as 23. Empty when there are none. */
+  urls: string[];
   warnings: string[];
   error?: string;
 };
@@ -99,7 +101,8 @@ export const validateIntent = (input: IntentInput): IntentValidation => {
     weighted,
     remaining,
     composed,
-    intent_url: buildIntentUrl(input),
+    intent_url: buildIntentUrl({ ...input, text: input.text.trim() }),
+    urls: urls.map((u) => u.url),
     warnings,
     ...(valid
       ? {}
