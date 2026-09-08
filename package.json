@@ -1,6 +1,6 @@
 {
   "name": "@mgcrea/mcp-x",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Model Context Protocol server for the X (Twitter) API v2",
   "keywords": [
     "mcp",
