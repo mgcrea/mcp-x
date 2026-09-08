@@ -133,6 +133,10 @@ export const POST_QUERY = {
     "conversation_id",
     "lang",
     "referenced_tweets",
+    // Without this, `text` comes back capped at 280 characters and a 25,000
+    // character post is served as its own first paragraph. A field on a read
+    // already being paid for, not a second read, so it costs nothing.
+    "note_tweet",
   ],
   "user.fields": ["username", "name", "verified"],
   "media.fields": ["type", "url", "preview_image_url", "alt_text"],

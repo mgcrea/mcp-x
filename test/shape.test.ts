@@ -223,6 +223,115 @@ describe("retweets", () => {
   });
 });
 
+describe("long-form posts", () => {
+  it("returns the whole note rather than the 280-character text", () => {
+    const full = `${"word ".repeat(120)}end`;
+    const res = shapePostsResponse({
+      data: [
+        {
+          id: "1",
+          author_id: "u1",
+          text: `${full.slice(0, 277)}\u2026`,
+          note_tweet: { text: full },
+        },
+      ],
+      includes: { users: [{ id: "u1", username: "writer" }] },
+    });
+    expect(res.posts[0]?.text).toBe(full);
+    expect(res.posts[0]?.text).not.toMatch(/\u2026$/);
+  });
+
+  it("expands the note's own urls, not the truncated text's", () => {
+    // The trap this exists to pin. Both entity sets are present and the
+    // top-level offsets are IN RANGE for the longer string — they just point
+    // somewhere else in it, so a bounds check cannot catch the mistake.
+    const res = shapePostsResponse({
+      data: [
+        {
+          id: "1",
+          author_id: "u1",
+          text: "see https://t.co/short",
+          entities: {
+            urls: [{ start: 4, end: 22, url: "https://t.co/short", expanded_url: "https://WRONG" }],
+          },
+          note_tweet: {
+            text: "a much longer body that carries its link far along here https://t.co/long tail",
+            entities: {
+              urls: [
+                {
+                  start: 56,
+                  end: 73,
+                  url: "https://t.co/long",
+                  expanded_url: "https://acme.dev/essay",
+                },
+              ],
+            },
+          },
+        },
+      ],
+      includes: { users: [{ id: "u1", username: "writer" }] },
+    });
+    expect(res.posts[0]?.text).toBe(
+      "a much longer body that carries its link far along here https://acme.dev/essay tail",
+    );
+    expect(res.posts[0]?.text).not.toContain("WRONG");
+  });
+
+  it("keeps the note's t.co links when the note carries no entities", () => {
+    const res = shapePostsResponse({
+      data: [
+        {
+          id: "1",
+          author_id: "u1",
+          text: "short https://t.co/x",
+          entities: {
+            urls: [{ start: 6, end: 20, url: "https://t.co/x", expanded_url: "https://WRONG" }],
+          },
+          note_tweet: { text: "the long body https://t.co/x and more after it" },
+        },
+      ],
+      includes: { users: [{ id: "u1", username: "writer" }] },
+    });
+    expect(res.posts[0]?.text).toBe("the long body https://t.co/x and more after it");
+  });
+
+  it("unwraps a quoted long post too", () => {
+    const res = shapePostsResponse({
+      data: [
+        {
+          id: "1",
+          author_id: "u1",
+          text: "worth reading",
+          referenced_tweets: [{ type: "quoted", id: "900" }],
+        },
+      ],
+      includes: {
+        users: [
+          { id: "u1", username: "sharer" },
+          { id: "u2", username: "writer" },
+        ],
+        tweets: [
+          {
+            id: "900",
+            author_id: "u2",
+            text: "the first part of it\u2026",
+            note_tweet: { text: "the first part of it and everything that followed" },
+          },
+        ],
+      },
+    });
+    expect(res.posts[0]?.quotes?.text).toBe("the first part of it and everything that followed");
+  });
+
+  it("falls back to text when there is no note", () => {
+    const res = shapePostsResponse({
+      data: [{ id: "1", author_id: "u1", text: "just a short one" }],
+      includes: { users: [{ id: "u1", username: "writer" }] },
+    });
+    expect(res.posts[0]?.text).toBe("just a short one");
+  });
+});
+
 describe("media", () => {
   it("uses the preview image for a video, which has no url field", () => {
     const res = shapePostsResponse({

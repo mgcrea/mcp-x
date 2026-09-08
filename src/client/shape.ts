@@ -114,6 +114,30 @@ const expandUrls = (text: string, raw: Rec): string => {
   return out;
 };
 
+/**
+ * The full text of a post, which for a long-form post is NOT `text`.
+ *
+ * X caps `text` at 280 characters however long the post really is — a Premium
+ * account can write 25,000 — and puts the whole thing in `note_tweet.text`,
+ * returned only when `note_tweet` is named in `tweet.fields`. Reading `text`
+ * alone silently truncates, which looks like a post that happens to end in an
+ * ellipsis rather than like a bug.
+ *
+ * The entities are taken from the note as well, never from the post. That is
+ * the part worth being careful about: `expandUrls` splices by offset, and the
+ * top-level `entities.urls` offsets are indices into the TRUNCATED text. Reused
+ * against the longer string they land in range and in the wrong place, so the
+ * bounds check above waves them through and the content is corrupted rather
+ * than left alone. A note whose own entities carry no urls simply keeps its
+ * t.co links, which is the right way to be wrong here.
+ */
+const fullText = (raw: Rec): string => {
+  const note = isRecord(raw.note_tweet) ? raw.note_tweet : undefined;
+  const noteText = note ? str(note.text) : undefined;
+  if (note && noteText) return expandUrls(noteText, note);
+  return expandUrls(str(raw.text) ?? "", raw);
+};
+
 const shapeMedia = (raw: Rec, index: Includes): string[] | undefined => {
   const attachments = isRecord(raw.attachments) ? raw.attachments : undefined;
   const keys = attachments && Array.isArray(attachments.media_keys) ? attachments.media_keys : [];
@@ -181,12 +205,12 @@ export type ShapedPost = {
 const shapeRef = (id: string, index: Includes): ShapedRef => {
   const raw = index.tweets.get(id);
   if (!raw) return { id }; // deleted, protected, or simply not requested
-  const text = str(raw.text);
+  const text = fullText(raw);
   const authorId = str(raw.author_id);
   return {
     id,
     ...(authorId ? { author: formatAuthor(authorId, index) } : {}),
-    ...(text ? { text: expandUrls(text, raw) } : {}),
+    ...(text ? { text } : {}),
     ...(str(raw.created_at) ? { created_at: str(raw.created_at) } : {}),
   };
 };
@@ -203,10 +227,9 @@ export const shapePost = (raw: Rec, index: Includes): ShapedPost => {
   };
 
   const reposts = refOf("retweeted");
-  const rawText = str(raw.text) ?? "";
   // A retweet's own `text` is a truncated "RT @someone: …". Show the original's
   // text instead, so the model reads content rather than an ellipsis.
-  const text = reposts?.text ? reposts.text : expandUrls(rawText, raw);
+  const text = reposts?.text ? reposts.text : fullText(raw);
 
   const metrics = shapeMetrics(raw);
   const media = shapeMedia(raw, index);
