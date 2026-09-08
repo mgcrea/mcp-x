@@ -75,7 +75,11 @@ export type ToolContext = {
    * re-fetched on every call. Absent when OAuth is unconfigured.
    */
   tokenStore?: TokenStore | undefined;
-  /** Present only when a client id is configured; its presence registers the login tools. */
+  /**
+   * Present only when a client id is configured. `x_login` is registered either
+   * way and refuses with what to set when this is absent, so its presence
+   * gates the login itself rather than the tool.
+   */
   login?: ((open: boolean) => Promise<LoginSummary>) | undefined;
   logout?: (() => void) | undefined;
   /** Present only when X_ADS_ENABLED is on and an OAuth client id is configured. */
@@ -96,10 +100,11 @@ export type LoginSummary = {
  *
  * Read tools and the free compose tools are always registered. The paid write
  * tools appear only when `allowWrites` *and* `writeBackend === "api"`;
- * `x_search_all` only when full-archive access is enabled; and the login tools
- * and user-context timelines only when an OAuth client id is configured — so
- * with the defaults those tools are not merely refused, they are invisible and
- * cannot be called at all.
+ * `x_search_all` only when full-archive access is enabled; and the user-context
+ * timelines only when an OAuth client id is configured — so with the defaults
+ * those tools are not merely refused, they are invisible and cannot be called
+ * at all. The login tools are the exception and are always registered; see
+ * `registerAuthTools` for why a supervisor needs them to be.
  */
 export const registerTools = (server: McpServer, client: XApiClient, ctx: ToolContext): void => {
   // Always available: these run locally and need no credentials at all. They are

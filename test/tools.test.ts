@@ -73,10 +73,15 @@ describe("with no credentials configured", () => {
   // and leaving no way to discover what to configure.
   it("still connects, and serves the tools that need no credentials", async () => {
     const names = await (await connect({}, undefined, { realAuth: true })).toolNames();
+    // x_login and x_logout are here without being usable: a supervisor calls
+    // them by name off its own catalog, so they have to exist in order to
+    // answer with what is missing rather than with a protocol error.
     expect(names).toEqual([
       "x_build_search_query",
       "x_compose_post",
       "x_get_auth_status",
+      "x_login",
+      "x_logout",
       "x_validate_post",
     ]);
   });
@@ -130,11 +135,13 @@ const BEARER_TOOLS = [
   "x_get_user_mentions",
   "x_get_user_posts",
   "x_get_users",
+  "x_login",
+  "x_logout",
   "x_request",
   "x_search_recent",
   "x_validate_post",
 ];
-const USER_TOOLS = ["x_get_bookmarks", "x_get_home_timeline", "x_login", "x_logout"];
+const USER_TOOLS = ["x_get_bookmarks", "x_get_home_timeline"];
 const PAID_WRITE_TOOLS = ["x_create_post", "x_delete_post"];
 const exact = (...groups: string[][]): string[] => groups.flat().toSorted();
 
@@ -209,18 +216,36 @@ describe("tool registration matrix", () => {
     }
   });
 
-  it("hides the login and user-context tools without an OAuth client id", async () => {
+  it("hides the user-context tools without an OAuth client id", async () => {
     const names = await (await connect()).toolNames();
-    for (const tool of ["x_login", "x_logout", "x_get_bookmarks", "x_get_home_timeline"]) {
+    for (const tool of ["x_get_bookmarks", "x_get_home_timeline"]) {
       expect(names).not.toContain(tool);
     }
     // Status is always available, so you can find out *why* the rest are missing.
     expect(names).toContain("x_get_auth_status");
   });
 
-  it("registers the login and user-context tools once a client id is configured", async () => {
+  // Registered without a client id ON PURPOSE. A supervisor's Sign in button
+  // calls `x_login` by name off its own catalog, so hiding the tool turns a
+  // missing variable into the SDK's `Tool x_login not found` — a protocol
+  // error that names neither the cause nor the fix.
+  it("keeps the login tools registered without an OAuth client id", async () => {
+    const names = await (await connect()).toolNames();
+    for (const tool of ["x_login", "x_logout"]) {
+      expect(names).toContain(tool);
+    }
+  });
+
+  it("refuses x_login without a client id, naming the variable and the callback", async () => {
+    const res = await (await connect()).call("x_login", { open: false });
+    expect(res.isToolError).toBe(true);
+    expect(res.error).toContain("X_CLIENT_ID");
+    expect(res.error).toContain("/callback");
+  });
+
+  it("registers the user-context tools once a client id is configured", async () => {
     const names = await (await connect({ X_BEARER_TOKEN: "t", X_CLIENT_ID: "cid" })).toolNames();
-    for (const tool of ["x_login", "x_logout", "x_get_bookmarks", "x_get_home_timeline"]) {
+    for (const tool of ["x_get_bookmarks", "x_get_home_timeline"]) {
       expect(names).toContain(tool);
     }
   });

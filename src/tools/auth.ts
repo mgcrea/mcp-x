@@ -3,7 +3,21 @@ import { z } from "zod";
 
 import { fileMode } from "#/client/tokens";
 import type { ToolContext } from "#/tools/index";
-import { wrap } from "#/tools/util";
+import { fail, wrap } from "#/tools/util";
+
+/**
+ * What `x_login` says when there is no client id to log in with.
+ *
+ * Names the variable and the callback in one breath because they fail
+ * together: X matches `redirect_uri` byte for byte, and under a supervisor the
+ * port is assigned per profile — so the URL to register is this profile's, not
+ * the one in anybody's notes.
+ */
+const unconfigured = (redirectUri: string): string =>
+  "No OAuth2 client id is configured, so there is no app to log in to. Set X_CLIENT_ID to your " +
+  "app's OAuth 2.0 Client ID from https://console.x.com, then call x_login again. Choose Type " +
+  "of App = Native App when creating it: that makes it a public PKCE client, which is what this " +
+  `server expects. Register ${redirectUri} as the app's callback URL, byte for byte.`;
 
 /**
  * The auth tools double as the "Authenticate button" for supervisors that
@@ -11,6 +25,14 @@ import { wrap } from "#/tools/util";
  * it calls with no arguments — status, login, logout — and reads one field
  * from the status reply: a top-level boolean `signedIn`. Everything else here
  * is for a human or a model. Keep those three shapes stable.
+ *
+ * All three are registered UNCONDITIONALLY, including with no client id
+ * configured. A supervisor calls them by name off its own catalog rather than
+ * off this server's tool list, so hiding one does not hide the button that
+ * calls it: the click reaches a server that never registered `x_login` and
+ * comes back as the SDK's `Tool x_login not found` — a protocol error naming
+ * a tool the user cannot see, about a cause it does not mention. One extra
+ * entry in the listing buys the sentence that actually fixes it.
  */
 export const registerAuthTools = (server: McpServer, ctx: ToolContext): void => {
   server.registerTool(
@@ -125,8 +147,6 @@ export const registerAuthTools = (server: McpServer, ctx: ToolContext): void => 
       }),
   );
 
-  if (!ctx.login) return;
-
   const login = ctx.login;
 
   server.registerTool(
@@ -137,9 +157,10 @@ export const registerAuthTools = (server: McpServer, ctx: ToolContext): void => 
         "Start the OAuth2 login. Prints a URL (and opens your browser) for you to authorize the " +
         "app, waits up to two minutes for the callback, then stores a refresh token in the token " +
         "file with mode 600. Only needed for bookmarks, the home timeline, API writes and Ads — " +
-        "public reads and search work with the Bearer token alone. The callback URL shown by " +
-        "x_get_auth_status must be registered with the X app first. Under Bastion, the Sign in " +
-        "button in the profile editor calls this tool.",
+        "public reads and search work with the Bearer token alone. Needs X_CLIENT_ID set, and " +
+        "the callback URL shown by x_get_auth_status registered with the X app first; without " +
+        "either it refuses with what to fix. Under Bastion, the Sign in button in the profile " +
+        "editor calls this tool.",
       inputSchema: z.object({
         open: z.boolean().default(true).describe("Open the authorize URL in your browser."),
       }),
@@ -148,8 +169,9 @@ export const registerAuthTools = (server: McpServer, ctx: ToolContext): void => 
       // it would leave a read-only install unable to see its own account.
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
     },
-    async ({ open }) =>
-      wrap(async () => {
+    async ({ open }) => {
+      if (!login) return fail(unconfigured(ctx.redirectUri));
+      return wrap(async () => {
         const result = await login(open);
         return {
           signedIn: true,
@@ -161,7 +183,8 @@ export const registerAuthTools = (server: McpServer, ctx: ToolContext): void => 
             "The refresh token is stored with mode 600 and rotates on every refresh. The tools " +
             "that need a user session were already registered, so no restart is needed.",
         };
-      }),
+      });
+    },
   );
 
   server.registerTool(
