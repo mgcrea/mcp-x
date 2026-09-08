@@ -105,9 +105,15 @@ jobs:
             | grep -o '"name":"x_[a-z_]*"' | sort -u | tr -d '"' | sed 's/name://'
           }
           list > /tmp/phase1.txt
+          # x_login and x_logout are here even with nothing configured: a
+          # supervisor's Sign in button calls x_login by name off its own
+          # catalog, so the tool has to exist to answer with what to set
+          # rather than with the MCP SDK's generic "Tool x_login not found".
           expected='x_build_search_query
           x_compose_post
           x_get_auth_status
+          x_login
+          x_logout
           x_validate_post'
           diff <(echo "$expected" | sed 's/^ *//') /tmp/phase1.txt \
             || { echo "phase 1: unconfigured server did not expose exactly the free tools"; exit 1; }
@@ -116,11 +122,10 @@ jobs:
           grep -qx 'x_get_post' /tmp/phase2.txt || { echo "phase 2: read tools missing"; exit 1; }
           ! grep -q 'x_create_post\|x_delete_post' /tmp/phase2.txt || { echo "phase 2: paid writes leaked"; exit 1; }
           ! grep -q 'x_ads_' /tmp/phase2.txt || { echo "phase 2: ads tools leaked"; exit 1; }
-          ! grep -q 'x_login' /tmp/phase2.txt || { echo "phase 2: login leaked without a client id"; exit 1; }
 
           list X_BEARER_TOKEN=ci-fake X_CLIENT_ID=ci X_ALLOW_WRITES=1 X_WRITE_BACKEND=api > /tmp/phase3.txt
           grep -qx 'x_create_post' /tmp/phase3.txt || { echo "phase 3: paid writes did not register"; exit 1; }
-          grep -qx 'x_login' /tmp/phase3.txt || { echo "phase 3: login did not register"; exit 1; }
+          grep -qx 'x_login' /tmp/phase3.txt || { echo "phase 3: login tool went missing with a client id configured"; exit 1; }
 
           # A contradiction between flags must degrade, never exit: this once
           # took the whole server down with the explanation swallowed.
