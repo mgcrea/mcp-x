@@ -13,6 +13,7 @@ Model Context Protocol server for the **X (Twitter) API v2** — built for readi
 - **A serious reader.** Post lookup, recent and full-archive search, profiles, user timelines, thread reconstruction, bookmarks and your home timeline — with X's query syntax exposed properly.
 - **Readable output.** X returns posts whose author, quoted post and real URLs live in a separate `includes` sidecar. Every tool here resolves that first, so posts arrive with the handle inline, t.co links expanded, and retweets showing the original text.
 - **Free posting.** `x_compose_post` returns an [`x.com/intent/tweet`](https://docs.x.com/x-for-websites/post-button/guides/web-intent) URL you click. No credentials, no API quota, no cost — and nothing publishes without a human click.
+- **X Articles, kept in sync with their source.** Read any Article in full, check a published one against the Markdown it came from, and — behind the write flags — draft and publish new ones from Markdown, images included. X's API cannot edit a published Article, so `x_compare_article` tells you exactly what to change in X's editor. See [Articles](#articles).
 - **Cost-aware by design.** X is pay-per-use. Every read reports what it cost, repeat reads inside a UTC day are free, and a budget ceiling stops a runaway loop before the request goes out.
 - **Ads, when you ask for it.** Campaigns, line items, targeting, audiences and performance analytics through the [X Ads API](https://docs.x.com/x-ads-api/introduction). Needs its own approval from X and is off unless configured; campaign writes are a second switch again, and anything created starts PAUSED.
 - **Official API only.** No cookie scraping, no password automation, nothing that risks your account.
@@ -42,17 +43,20 @@ Run `x_count_recent` before a broad search — it returns totals without reading
 
 **Ads is billed elsewhere.** Ads API calls are not metered by X's pay-per-use read pricing, so they cost nothing and never appear in `x_get_usage_report`. What they manage does: a campaign spends your advertising budget, on X's invoice rather than the API's, and no tool here can see that number. Treat `x_get_usage_report` as silent on ads rather than as reporting zero.
 
+**Articles are unpriced.** X publishes no rate for its Articles or media upload endpoints (checked 2026-09-12), so creating a draft, uploading its images and publishing it are not estimated and do not appear in `x_get_usage_report`. Reading an Article is an ordinary post read.
+
 ## Security
 
 - **Supply chain.** Two runtime dependencies: the MCP SDK and zod. The HTTP layer is hand-rolled `fetch` — no HTTP library, no logger, nothing else on the tree.
 - **Verified builds.** npm releases carry [provenance](https://docs.npmjs.com/generating-provenance-statements) via OIDC trusted publishing; container images are multi-arch, ship an SBOM, and are signed with [cosign](https://docs.sigstore.dev/cosign/signing/overview/).
 - **Your credentials.** Read from the environment or a config file you control, sent only to `api.x.com` (and `ads-api.x.com` when ads is enabled), never logged. The one other host ever contacted is `ton.twimg.com`, where X serves finished analytics reports — those downloads carry no credential at all, and any other host in a report URL is refused. The **one** file this server writes is `tokens.json` (mode 600), and only if you use OAuth — it has to persist a rotating refresh token. Everything else is read-only. Every request has a 30-second deadline, and a rate-limit window longer than 30 seconds is reported rather than waited out.
 - **Blast radius.** Paid writes are off by default and _unregistered_ rather than refused, so an agent cannot call what does not exist. The free compose path never publishes without a human clicking Post. Ads writes are a separate switch on the same principle, campaigns and line items are created `PAUSED` unless a call explicitly asks otherwise, and budgets are taken in major currency units — the ×1,000,000 mistake is not expressible.
+- **Local files.** The Article tools read the Markdown file and images you name, and nothing else: a `.md`, `.markdown` or `.mdx` file by absolute path, and images only when their content — not their name — is a PNG, JPEG or WebP under 5 MB. A key file renamed `cover.png` is refused before any request. Only `x_create_article_draft` sends what it reads to X.
 - **No scraping.** This server never touches session cookies or your password. Tools that do are a ban risk regardless of how they are marketed.
 
 ## Configure
 
-**The server starts with no configuration at all.** In that state it registers only the tools that need no credentials — `x_compose_post`, `x_validate_post`, `x_build_search_query` and `x_get_auth_status` — and `x_get_auth_status` tells you exactly what to set for the rest. It never refuses to start over missing credentials, because an MCP server that exits shows up in the client as a bare `Connection closed` with the explanation swallowed. The same goes for a contradiction between flags (`X_ADS_ENABLED` without a client id, say): the flag is switched off, and the reason is printed at startup and returned by `x_get_auth_status` under `warnings`.
+**The server starts with no configuration at all.** In that state it registers only the tools that need no credentials — `x_compose_post`, `x_validate_post`, `x_validate_article`, `x_build_search_query` and `x_get_auth_status` — and `x_get_auth_status` tells you exactly what to set for the rest. It never refuses to start over missing credentials, because an MCP server that exits shows up in the client as a bare `Connection closed` with the explanation swallowed. The same goes for a contradiction between flags (`X_ADS_ENABLED` without a client id, say): the flag is switched off, and the reason is printed at startup and returned by `x_get_auth_status` under `warnings`.
 
 To read anything, one variable is required:
 
@@ -62,19 +66,19 @@ export X_BEARER_TOKEN="..."   # console.x.com → your app → Keys and Tokens
 
 That covers every public read: lookup, search, profiles, timelines — no OAuth needed. See [Getting credentials](#getting-credentials) below, and [.env.example](./.env.example) for the rest. The ones worth knowing by name:
 
-| Variable                | Meaning                                                                                                            |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `X_BEARER_TOKEN`        | App-only Bearer token. Every public read.                                                                          |
-| `X_CLIENT_ID`           | OAuth 2.0 client id. Bookmarks, home timeline, API writes, Ads.                                                    |
-| `X_MONTHLY_BUDGET_USD`  | Spend ceiling for this process. A read whose estimate would cross it is refused before the request goes out.       |
-| `X_DEFAULT_MAX_RESULTS` | Default page size for every read tool (10).                                                                        |
-| `X_PRICING`             | JSON object overriding the price table, for deployments with no config file.                                       |
-| `X_ALLOW_WRITES`        | With `X_WRITE_BACKEND=api`, registers the paid `x_create_post` / `x_delete_post`, and lets `x_request` mutate.     |
-| `X_ENABLE_FULL_ARCHIVE` | Registers `x_search_all`.                                                                                          |
-| `X_ADS_ENABLED`         | Registers the Ads API tools (needs `X_CLIENT_ID`).                                                                 |
-| `X_ADS_ALLOW_WRITES`    | Registers the campaign-mutating Ads tools.                                                                         |
-| `X_ADS_ACCOUNT_ID`      | The ads account to act on. Optional with exactly one account; with several, a call without `accountId` is refused. |
-| `X_ADS_BASE_URL`        | Point at the sandbox (see below) before touching a live account.                                                   |
+| Variable                | Meaning                                                                                                                                                |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `X_BEARER_TOKEN`        | App-only Bearer token. Every public read.                                                                                                              |
+| `X_CLIENT_ID`           | OAuth 2.0 client id. Bookmarks, home timeline, API writes, Ads.                                                                                        |
+| `X_MONTHLY_BUDGET_USD`  | Spend ceiling for this process. A read whose estimate would cross it is refused before the request goes out.                                           |
+| `X_DEFAULT_MAX_RESULTS` | Default page size for every read tool (10).                                                                                                            |
+| `X_PRICING`             | JSON object overriding the price table, for deployments with no config file.                                                                           |
+| `X_ALLOW_WRITES`        | With `X_WRITE_BACKEND=api`, registers the paid `x_create_post` / `x_delete_post` and the Article draft and publish tools, and lets `x_request` mutate. |
+| `X_ENABLE_FULL_ARCHIVE` | Registers `x_search_all`.                                                                                                                              |
+| `X_ADS_ENABLED`         | Registers the Ads API tools (needs `X_CLIENT_ID`).                                                                                                     |
+| `X_ADS_ALLOW_WRITES`    | Registers the campaign-mutating Ads tools.                                                                                                             |
+| `X_ADS_ACCOUNT_ID`      | The ads account to act on. Optional with exactly one account; with several, a call without `accountId` is refused.                                     |
+| `X_ADS_BASE_URL`        | Point at the sandbox (see below) before touching a live account.                                                                                       |
 
 ### Getting credentials
 
@@ -193,6 +197,8 @@ Writes are marked `*`, and `†` means a `confirm: true` argument is required. T
 
 **Compose** — `x_validate_post` (free, local) · `x_compose_post` (free, web intent) · `x_create_post` \*† · `x_delete_post` \*† _(the last two need `X_ALLOW_WRITES=1` **and** `X_WRITE_BACKEND=api`)_
 
+**Articles** — `x_get_article` · `x_compare_article` · `x_validate_article` (free, local) · `x_create_article_draft` \*† · `x_publish_article` \*† _(the last two need `X_ALLOW_WRITES=1` **and** `X_WRITE_BACKEND=api`)_
+
 **Timelines** — `x_get_home_timeline` · `x_get_bookmarks` _(need OAuth login; X serves these for your own account only)_
 
 **Auth** — `x_get_auth_status` · `x_login` \* · `x_logout` \* _(the last two need `X_CLIENT_ID`)_
@@ -252,6 +258,23 @@ The URL comes back whether or not a browser could be opened, so Docker and SSH b
 
 **Web intents cannot** attach media, create polls, make native quote posts, or build threads — those need the paid API. Replying to a post _does_ work (`inReplyTo`).
 
+### Articles
+
+X Articles are the long-form posts with a title, headings and images. The API behind them is small and lopsided, and that decides how these tools work:
+
+- **Reading** is an ordinary post lookup. `x_get_article` returns the title, the whole body (paged with `offset` — an Article can run past 50,000 characters), the cover, and the images, links and posts it embeds, for one post read. Every other read marks an Article post with `article.title`, since its own text is only a link.
+- **Writing** is two endpoints: create a draft, publish a draft. There is no update, no delete, and no way to read a draft back — so **a published Article cannot be edited through the API.** X's web editor can.
+- **Keeping a copy in sync** is therefore a comparison, not a push. `x_compare_article` converts your Markdown exactly as a draft would, reads the Article, and lists only the title and paragraphs that differ, each anchored to the unchanged paragraph before it — the edits to make in X's editor. Whitespace and curly quotes are ignored; images, links and formatting are not compared.
+- **Drafting from Markdown** is checked locally first. `x_validate_article` is free and shows the title, the outline, each image and everything an Article cannot express. `x_create_article_draft` then uploads each local image and the cover and creates the draft, and `x_publish_article` makes it public.
+
+What converts: headings (h4–h6 become level three), bold, italic, strikethrough, links, lists (flattened — Articles have no nesting), quotes, dividers, and code blocks and tables (as X's markdown blocks, capped at 10,000 weighted characters per Article). An image, or an `x.com/…/status/…` link, on a line of its own becomes an embed. Inline code loses its style. Front matter supplies `title` and `cover`, and relative image paths resolve against the Markdown file, as a site generator reads them. Relative links (`/blog/next-post`) resolve against `linkBaseUrl`, your site's address, when you pass it; without it they keep their text and lose the link.
+
+Before drafting:
+
+- The posting account needs **X Premium**.
+- Images must be local PNG, JPEG or WebP files up to 5 MB. Remote URLs are not downloaded for you.
+- Uploads need the `media.write` scope. It is requested at login whenever writes are on, but a login made before this version lacks it — run `x_login` again. It is deliberately not _required_ of a stored token, so an older login keeps working for everything else in the meantime.
+
 ## Troubleshooting
 
 **`MCP error -32000: Connection closed`** — the server process died on startup. It does _not_ do this for missing credentials (see [Configure](#configure)), so check, in order:
@@ -260,7 +283,7 @@ The URL comes back whether or not a browser could be opened, so Docker and SSH b
 2. You ran `pnpm build` — `dist/cli.js` has to exist.
 3. Run it by hand to see stderr, which MCP clients swallow: `X_BEARER_TOKEN=... node dist/cli.js`. A config error prints one readable line; add `X_DEBUG=1` for the stack.
 
-**Only four tools show up** — no credentials are configured. Call `x_get_auth_status`; it returns the setup steps.
+**Only the free local tools show up** — no credentials are configured. Call `x_get_auth_status`; it returns the setup steps.
 
 **I want OAuth but see no way in** — OAuth needs an app you register. See [Getting credentials](#getting-credentials): create a **Native App** at console.x.com, set `X_CLIENT_ID` to its Client ID, register the callback, then run `npx @mgcrea/mcp-x login` (or call `x_login`). There is no way to log in without a client id — X has nothing to authorize against.
 
