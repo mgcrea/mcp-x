@@ -8,7 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 import { staticTokenProvider } from "#/client/auth";
 import { effectiveScopes, loadConfig, type Config } from "#/config";
 import { createServer } from "#/server";
-import { jsonResponse } from "#test/helpers";
+import { initOf, jsonResponse } from "#test/helpers";
 
 const ABSENT = "/nonexistent/config.json";
 
@@ -82,6 +82,7 @@ describe("with no credentials configured", () => {
       "x_get_auth_status",
       "x_login",
       "x_logout",
+      "x_validate_article",
       "x_validate_post",
     ]);
   });
@@ -122,8 +123,10 @@ describe("with no credentials configured", () => {
  */
 const BEARER_TOOLS = [
   "x_build_search_query",
+  "x_compare_article",
   "x_compose_post",
   "x_count_recent",
+  "x_get_article",
   "x_get_auth_status",
   "x_get_post",
   "x_get_posts",
@@ -139,10 +142,16 @@ const BEARER_TOOLS = [
   "x_logout",
   "x_request",
   "x_search_recent",
+  "x_validate_article",
   "x_validate_post",
 ];
 const USER_TOOLS = ["x_get_bookmarks", "x_get_home_timeline"];
-const PAID_WRITE_TOOLS = ["x_create_post", "x_delete_post"];
+const PAID_WRITE_TOOLS = [
+  "x_create_article_draft",
+  "x_create_post",
+  "x_delete_post",
+  "x_publish_article",
+];
 const exact = (...groups: string[][]): string[] => groups.flat().toSorted();
 
 describe("tool registration matrix", () => {
@@ -184,6 +193,8 @@ describe("tool registration matrix", () => {
   it("still hides the paid write tools when allowWrites is on but the backend is intent", async () => {
     const names = await (await connect({ X_BEARER_TOKEN: "t", X_ALLOW_WRITES: "1" })).toolNames();
     expect(names).not.toContain("x_create_post");
+    expect(names).not.toContain("x_create_article_draft");
+    expect(names).not.toContain("x_publish_article");
   });
 
   it("registers the paid write tools only when both flags are set", async () => {
@@ -271,6 +282,10 @@ describe("tool annotations", () => {
     expect(byName.get("x_search_recent")?.readOnlyHint).toBe(true);
     expect(byName.get("x_delete_post")?.destructiveHint).toBe(true);
     expect(byName.get("x_create_post")?.destructiveHint).toBe(false);
+    expect(byName.get("x_get_article")?.readOnlyHint).toBe(true);
+    expect(byName.get("x_compare_article")?.readOnlyHint).toBe(true);
+    // Public and undoable only by a delete — but it overwrites nothing that existed.
+    expect(byName.get("x_publish_article")?.destructiveHint).toBe(false);
     // Not read-only (it may open a browser), but not destructive either.
     expect(byName.get("x_compose_post")?.readOnlyHint).toBe(false);
     expect(byName.get("x_compose_post")?.destructiveHint).toBe(false);
@@ -1194,7 +1209,7 @@ describe("tool contract", () => {
 
   it("registers the whole surface under the fullest configuration", async () => {
     const names = await (await connect(everything)).toolNames();
-    expect(names.length).toBeGreaterThanOrEqual(48);
+    expect(names.length).toBeGreaterThanOrEqual(53);
   });
 
   it("gives every tool a title prefixed with the service name", async () => {
@@ -1265,6 +1280,372 @@ describe("x_create_post cost note", () => {
     );
     const res = await h.call("x_create_post", { text: "read https://acme.dev/v2", confirm: true });
     expect(res.cost.estimated_usd).toBe(0.2);
+  });
+});
+
+/** A post carrying an Article, as X answers `tweet.fields=article` with both media expansions. */
+const ARTICLE_RESPONSE = {
+  data: [
+    {
+      id: "2097319903967539446",
+      text: "Some thoughts https://t.co/kravmzPyFJ",
+      author_id: "68476943",
+      created_at: "2026-09-08T13:43:26.000Z",
+      edit_history_tweet_ids: ["2097319903967539446"],
+      article: {
+        title: "The late Software Developer",
+        preview_text: "It is exciting.",
+        plain_text: "It is exciting.\nSecond paragraph with @mgcrea and #mcp.",
+        cover_media: "3_1",
+        media_entities: ["3_2", "3_9"],
+        entities: {
+          urls: [
+            { text: "https://docs.x.com", start: 1, end: 2 },
+            { text: "https://docs.x.com", start: 3, end: 4 },
+          ],
+          mentions: [{ username: "mgcrea", start: 38, end: 45 }],
+          hashtags: [{ text: "mcp", start: 50, end: 54 }],
+          tweets: [{ id: "1799000000000000001" }],
+        },
+      },
+    },
+  ],
+  includes: {
+    users: [{ id: "68476943", username: "mgcrea", name: "Olivier" }],
+    media: [
+      { media_key: "3_1", type: "photo", url: "https://pbs.twimg.com/media/cover.jpg" },
+      { media_key: "3_2", type: "photo", url: "https://pbs.twimg.com/media/inline.jpg" },
+    ],
+  },
+};
+
+const ARTICLE_POST = "2097319903967539446";
+
+describe("x_get_article", () => {
+  it("returns the whole Article resolved, and asks X for the body field", async () => {
+    const h = await connect(
+      undefined,
+      vi.fn(async () => jsonResponse(ARTICLE_RESPONSE)),
+    );
+    const res = await h.call("x_get_article", { postId: ARTICLE_POST });
+    const body = ARTICLE_RESPONSE.data[0]?.article.plain_text as string;
+
+    expect(res.article).toEqual({
+      post_id: ARTICLE_POST,
+      url: `https://x.com/mgcrea/status/${ARTICLE_POST}`,
+      author: "@mgcrea (Olivier)",
+      created_at: "2026-09-08T13:43:26.000Z",
+      title: "The late Software Developer",
+      cover_image: "https://pbs.twimg.com/media/cover.jpg",
+      images: ["photo: https://pbs.twimg.com/media/inline.jpg", "media (not expanded): 3_9"],
+      links: ["https://docs.x.com"],
+      embedded_posts: ["https://x.com/i/web/status/1799000000000000001"],
+      mentions: ["@mgcrea"],
+      hashtags: ["#mcp"],
+      body,
+      body_chars: body.length,
+    });
+    const url = new URL(h.urls()[0] as string);
+    expect(url.searchParams.get("tweet.fields")?.split(",")).toContain("article");
+    expect(url.searchParams.get("expansions")).toContain("article.media_entities");
+    expect(res.cost).toMatchObject({ billable_post_reads: 1 });
+  });
+
+  it("pages a long body out of the cache, issuing a single request", async () => {
+    const response = structuredClone(ARTICLE_RESPONSE);
+    (response.data[0] as { article: { plain_text: string } }).article.plain_text = "a".repeat(2500);
+    const fetchMock = vi.fn(async () => jsonResponse(response));
+    const h = await connect(undefined, fetchMock);
+
+    const first = await h.call("x_get_article", { postId: ARTICLE_POST, maxChars: 1000 });
+    expect(first.article.body).toHaveLength(1000);
+    expect(first.article.next_offset).toBe(1000);
+
+    const last = await h.call("x_get_article", {
+      postId: ARTICLE_POST,
+      offset: 2000,
+      maxChars: 1000,
+    });
+    expect(last.article.body).toHaveLength(500);
+    expect(last.article.next_offset).toBeUndefined();
+    // The lists came with the first page; later pages carry only the text.
+    expect(last.article).not.toHaveProperty("images");
+    expect(last.cost).toMatchObject({ billable_post_reads: 0, free_from_cache: 1 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  // x_get_post caches a shape with no body under the same id. Serving that to
+  // x_get_article would return an Article with nothing in it.
+  it("does not serve the body-less post x_get_post cached as an Article", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse(ARTICLE_RESPONSE));
+    const h = await connect(undefined, fetchMock);
+
+    const post = await h.call("x_get_post", { postId: ARTICLE_POST });
+    expect(post.post.article).toEqual({ title: "The late Software Developer" });
+    expect(new URL(h.urls()[0] as string).searchParams.get("tweet.fields")).toContain(
+      "article_title",
+    );
+
+    const res = await h.call("x_get_article", { postId: ARTICLE_POST });
+    expect(res.article.body).toContain("It is exciting.");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // Still billed once: X does not charge a second read of a post in one UTC day.
+    expect(res.cost).toMatchObject({ billable_post_reads: 0 });
+  });
+
+  it("says so when the post is not an Article", async () => {
+    const h = await connect(
+      undefined,
+      vi.fn(async () => jsonResponse({ data: [{ id: "1", text: "hi", author_id: "2" }] })),
+    );
+    const res = await h.call("x_get_article", { postId: "1" });
+    expect(res.error).toMatch(/not an Article/);
+  });
+});
+
+describe("x_compare_article", () => {
+  it("reports the paragraphs that drifted, with the Markdown as the source", async () => {
+    const response = {
+      data: [
+        {
+          id: "9",
+          author_id: "u",
+          article: { title: "Title", plain_text: "Intro.\nOld wording.\n \nOutro." },
+        },
+      ],
+      includes: { users: [{ id: "u", username: "mgcrea" }] },
+    };
+    const h = await connect(
+      undefined,
+      vi.fn(async () => jsonResponse(response)),
+    );
+    const res = await h.call("x_compare_article", {
+      postId: "9",
+      markdown: "# Title\n\nIntro.\n\nNew wording.\n\n![x](/a.png)\n\nOutro.",
+    });
+
+    expect(res.in_sync).toBe(false);
+    expect(res.title).toEqual({ same: true, text: "Title" });
+    expect(res.changes).toEqual([
+      { kind: "changed", after: "Intro.", source: "New wording.", x: "Old wording." },
+    ]);
+    expect(res.paragraphs).toEqual({ source: 3, x: 3, unchanged: 2 });
+    expect(res.next_step).toMatch(/cannot edit/);
+  });
+
+  it("is in sync when only whitespace and quote style differ", async () => {
+    const response = {
+      data: [{ id: "9", article: { title: "It’s here", plain_text: "“Quoted” text." } }],
+    };
+    const h = await connect(
+      undefined,
+      vi.fn(async () => jsonResponse(response)),
+    );
+    const res = await h.call("x_compare_article", {
+      postId: "9",
+      markdown: '"Quoted"   text.',
+      title: "It's here",
+    });
+    expect(res.in_sync).toBe(true);
+    expect(res.changes_total).toBe(0);
+  });
+
+  it("fails on a bad markdownPath before spending a read", async () => {
+    const h = await connect();
+    const res = await h.call("x_compare_article", { postId: "9", markdownPath: "relative.md" });
+    expect(res.isToolError).toBe(true);
+    expect(res.error).toMatch(/absolute/);
+    expect(h.fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("x_validate_article", () => {
+  it("previews the conversion with no credentials and no request", async () => {
+    const h = await connect({}, undefined, { realAuth: true });
+    const res = await h.call("x_validate_article", {
+      markdown: "# Hello\n\n#### Deep\n\ntext with `code`",
+    });
+    expect(res).toMatchObject({ ready: true, title: "Hello", blocks: 2, outline: ["### Deep"] });
+    expect(res.warnings).toHaveLength(2);
+    expect(res.content_state).toBeUndefined();
+    expect(h.fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("reports an image it could not upload as a problem, not a crash", async () => {
+    const h = await connect({}, undefined, { realAuth: true });
+    const res = await h.call("x_validate_article", { markdown: "# T\n\n![a](missing.png)" });
+    expect(res.isToolError).toBe(false);
+    expect(res.ready).toBe(false);
+    expect(res.problems[0]).toMatch(/markdownPath/);
+  });
+});
+
+describe("x_create_article_draft", () => {
+  const writes = { X_CLIENT_ID: "c", X_ALLOW_WRITES: "1", X_WRITE_BACKEND: "api" };
+  const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+  const DRAFT_ID = "1146654567674912769";
+
+  const routed = () =>
+    vi.fn(async (url: string) => {
+      if (String(url).includes("/2/media/upload")) return jsonResponse({ data: { id: "m-1" } });
+      return jsonResponse({ data: { id: DRAFT_ID, title: "Hello" } }, { status: 201 });
+    });
+
+  it("uploads each distinct image once, fills every slot, and creates the draft", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "x-draft-"));
+    try {
+      writeFileSync(join(dir, "shot.png"), PNG);
+      writeFileSync(
+        join(dir, "post.md"),
+        "---\ntitle: Hello\n---\n\nIntro.\n\n![one](./shot.png)\n\n![again](shot.png)\n",
+      );
+      const fetchMock = routed();
+      const h = await connect(writes, fetchMock);
+      const res = await h.call("x_create_article_draft", {
+        markdownPath: join(dir, "post.md"),
+        coverImagePath: "shot.png",
+        confirm: true,
+      });
+
+      expect(res).toMatchObject({
+        drafted: true,
+        article_id: DRAFT_ID,
+        images_uploaded: 1,
+        cover: "uploaded",
+      });
+      expect(h.urls().filter((u) => u.includes("/2/media/upload"))).toHaveLength(1);
+      expect(JSON.parse(String(initOf(fetchMock, 0).body))).toEqual({
+        media: PNG.toString("base64"),
+        media_category: "tweet_image",
+      });
+
+      const draftCall = h.urls().findIndex((u) => u.includes("/2/articles/draft"));
+      const body = JSON.parse(String(initOf(fetchMock, draftCall).body));
+      const media = [{ media_id: "m-1", media_category: "tweet_image" }];
+      expect(body.title).toBe("Hello");
+      expect(body.cover_media).toEqual(media[0]);
+      const images = body.content_state.entities.filter(
+        (e: { value: { type: string } }) => e.value.type === "image",
+      );
+      expect(images.map((e: { value: { data: unknown } }) => e.value.data)).toEqual([
+        { media_items: media },
+        { media_items: media },
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a file that is not an image before sending anything", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "x-draft-"));
+    try {
+      writeFileSync(join(dir, "id_ed25519.png"), "-----BEGIN OPENSSH PRIVATE KEY-----");
+      const h = await connect(writes, routed());
+      const res = await h.call("x_create_article_draft", {
+        markdown: `# Hi\n\nBody\n\n![](${join(dir, "id_ed25519.png")})`,
+        confirm: true,
+      });
+      expect(res.isToolError).toBe(true);
+      expect(res.error).toMatch(/not a PNG, JPEG or WebP/);
+      expect(h.fetchMock).not.toHaveBeenCalled();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("says to log in again when X refuses the upload", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "x-draft-"));
+    try {
+      writeFileSync(join(dir, "shot.png"), PNG);
+      const h = await connect(
+        writes,
+        vi.fn(async () => jsonResponse({ title: "Forbidden", detail: "scope" }, { status: 403 })),
+      );
+      const res = await h.call("x_create_article_draft", {
+        markdown: `# Hi\n\n![](${join(dir, "shot.png")})`,
+        confirm: true,
+      });
+      expect(res.isToolError).toBe(true);
+      expect(res.error).toMatch(/media\.write/);
+      expect(res.error).toMatch(/x_login/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a draft with no title before any request", async () => {
+    const h = await connect(writes, routed());
+    const res = await h.call("x_create_article_draft", { markdown: "Just a body.", confirm: true });
+    expect(res.isToolError).toBe(true);
+    expect(res.error).toMatch(/No title/);
+    expect(h.fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("requires confirm", async () => {
+    const h = await connect(writes, routed());
+    const res = await h.call("x_create_article_draft", { markdown: "# T\n\nBody" });
+    expect(res.isToolError).toBe(true);
+    expect(h.fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("x_publish_article", () => {
+  it("publishes the draft and returns the post that carries it", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ data: { post_id: "1346889436626259968" } }));
+    const h = await connect(
+      { X_CLIENT_ID: "c", X_ALLOW_WRITES: "1", X_WRITE_BACKEND: "api" },
+      fetchMock,
+    );
+    const res = await h.call("x_publish_article", {
+      articleId: "1146654567674912769",
+      confirm: true,
+    });
+    expect(res).toMatchObject({
+      published: true,
+      post_id: "1346889436626259968",
+      url: "https://x.com/i/web/status/1346889436626259968",
+    });
+    expect(h.urls()[0]).toMatch(/\/2\/articles\/1146654567674912769\/publish$/);
+    expect(initOf(fetchMock).method).toBe("POST");
+  });
+});
+
+describe("media.write is asked for, not required", () => {
+  // Requiring it would have treated every existing API-write login as no login
+  // at all — reads included — until the user logged in again.
+  it("keeps a stored write login signed in when it predates media.write", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "x-scopes-"));
+    const tokenFile = join(dir, "tokens.json");
+    writeFileSync(
+      tokenFile,
+      JSON.stringify({
+        version: 1,
+        clientId: "cid",
+        scopes: ["tweet.read", "users.read", "bookmark.read", "offline.access", "tweet.write"],
+        accessToken: "access-1",
+        refreshToken: "refresh-1",
+        expiresAt: Date.now() + 3_600_000,
+        obtainedAt: Date.now(),
+        username: "mgcrea",
+        userId: "1",
+      }),
+      { mode: 0o600 },
+    );
+    try {
+      const h = await connect(
+        {
+          X_CLIENT_ID: "cid",
+          X_TOKEN_FILE: tokenFile,
+          X_ALLOW_WRITES: "1",
+          X_WRITE_BACKEND: "api",
+        },
+        undefined,
+        { realAuth: true },
+      );
+      expect((await h.call("x_get_auth_status")).signedIn).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

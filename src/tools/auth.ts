@@ -69,6 +69,7 @@ export const registerAuthTools = (server: McpServer, ctx: ToolContext): void => 
             available_without_credentials: [
               "x_compose_post",
               "x_validate_post",
+              "x_validate_article",
               "x_build_search_query",
               "x_get_auth_status",
             ],

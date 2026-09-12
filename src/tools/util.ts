@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import type { DayCache, ResourceKind } from "#/client/cache";
+import type { CacheKind, DayCache, ResourceKind } from "#/client/cache";
 import type { CostNote, Ledger } from "#/client/cost";
 import {
   BudgetExceededError,
@@ -137,6 +137,12 @@ export const POST_QUERY = {
     // character post is served as its own first paragraph. A field on a read
     // already being paid for, not a second read, so it costs nothing.
     "note_tweet",
+    // An Article post's own `text` is a bare t.co link, so without this it
+    // reads as a link to nowhere in particular. `article_title` returns
+    // `article: { title }` and nothing else — NOT `article`, which would pull
+    // a body that runs past 50,000 characters into every search page just to
+    // be shaped away. x_get_article asks for the body when it is wanted.
+    "article_title",
   ],
   "user.fields": ["username", "name", "verified"],
   "media.fields": ["type", "url", "preview_image_url", "alt_text"],
@@ -189,13 +195,15 @@ export const cachedByIds = async <T>(
   ids: string[],
   fetchMissing: (missing: string[]) => Promise<Map<string, T>>,
   label: string,
+  /** Cache under a different key than the one billed, when the shape differs. See `CacheKind`. */
+  cacheKind: CacheKind = kind,
 ): Promise<{ items: T[]; cost: CostNote; notFound: string[] }> => {
   const cached = new Map<string, T>();
   const missing: string[] = [];
   let billed = 0;
   let freeFromLedger = 0;
   for (const id of ids) {
-    const hit = deps.cache.get(kind, id) as T | undefined;
+    const hit = deps.cache.get(cacheKind, id) as T | undefined;
     if (hit !== undefined) cached.set(id, hit);
     else missing.push(id);
   }
@@ -204,7 +212,7 @@ export const cachedByIds = async <T>(
     assertWithinBudget(deps, label, deps.ledger.estimate(kind, missing));
     const fetched = await fetchMissing(missing);
     for (const [id, item] of fetched) {
-      deps.cache.set(kind, id, item);
+      deps.cache.set(cacheKind, id, item);
       cached.set(id, item);
     }
     // Bill only what came back: X does not charge for an id it could not serve.

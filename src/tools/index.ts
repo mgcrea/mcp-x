@@ -8,6 +8,7 @@ import type { TokenStore } from "#/client/tokens";
 import type { XApiClient } from "#/client/x";
 import type { Pricing } from "#/config";
 import { registerAdsTools } from "#/tools/ads/index";
+import { registerArticleComposeTools, registerArticleTools } from "#/tools/articles";
 import { registerAuthTools } from "#/tools/auth";
 import { registerComposeTools } from "#/tools/compose";
 import { registerPostTools } from "#/tools/posts";
@@ -111,12 +112,16 @@ export const registerTools = (server: McpServer, client: XApiClient, ctx: ToolCo
   // registered first and unconditionally so that an unconfigured server is still
   // a useful one, rather than a connection that closes.
   registerComposeTools(server, client, ctx);
+  registerArticleComposeTools(server);
   registerAuthTools(server, ctx);
   registerQueryBuilderTool(server);
 
   if (!ctx.hasCredentials) return;
 
   registerPostTools(server, client, ctx);
+  // Reads always; the draft and publish tools only behind the same two flags
+  // as x_create_post, checked inside.
+  registerArticleTools(server, client, ctx);
   registerUserTools(server, client, ctx);
   registerSearchTools(server, client, ctx);
   registerUsageTools(server, client, ctx);

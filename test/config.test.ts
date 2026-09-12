@@ -16,6 +16,7 @@ import {
   hasAdsAccess,
   DEFAULT_ADS_BASE_URL,
   SANDBOX_ADS_BASE_URL,
+  requiredScopes,
 } from "#/config";
 
 let dir: string;
@@ -247,6 +248,17 @@ describe("effectiveScopes", () => {
   it("does not add tweet.write when writes are allowed but the backend is intent", () => {
     const config = loadConfig({ X_CLIENT_ID: "c", X_ALLOW_WRITES: "1" }, absent);
     expect(effectiveScopes(config)).not.toContain("tweet.write");
+  });
+
+  it("asks for media.write with the write backend, but never requires it of a stored token", () => {
+    const writes = loadConfig(
+      { X_CLIENT_ID: "c", X_ALLOW_WRITES: "1", X_WRITE_BACKEND: "api" },
+      absent,
+    );
+    expect(effectiveScopes(writes)).toContain("media.write");
+    expect(requiredScopes(writes)).toContain("tweet.write");
+    expect(requiredScopes(writes)).not.toContain("media.write");
+    expect(effectiveScopes(loadConfig({ X_CLIENT_ID: "c" }, absent))).not.toContain("media.write");
   });
 });
 

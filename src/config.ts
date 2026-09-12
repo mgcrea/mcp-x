@@ -450,8 +450,10 @@ export const adsSetupInstructions = (config: Config): string[] => [
  */
 export const effectiveScopes = (config: Config): string[] => {
   const scopes = [...config.scopes];
-  if (config.allowWrites && config.writeBackend === "api" && !scopes.includes("tweet.write")) {
-    scopes.push("tweet.write");
+  if (config.allowWrites && config.writeBackend === "api") {
+    if (!scopes.includes("tweet.write")) scopes.push("tweet.write");
+    // Article images and covers go through the media upload endpoint.
+    if (!scopes.includes("media.write")) scopes.push("media.write");
   }
   // Same rule for ads: ask for read access only when the tools are registered,
   // and for write access only when the write tools are. A read-only ads install
@@ -462,3 +464,16 @@ export const effectiveScopes = (config: Config): string[] => {
   }
   return scopes;
 };
+
+/**
+ * Asked for at login, never demanded of a stored token. A stored token missing
+ * a required scope is treated as no login at all, for every call — so making
+ * `media.write` required when Article images arrived would have signed out
+ * every existing API-write install, reads included, over a scope that only an
+ * image upload uses. An upload X refuses says to run x_login again instead.
+ */
+export const OPTIONAL_SCOPES: readonly string[] = ["media.write"];
+
+/** The scopes a stored token must hold to be used at all. */
+export const requiredScopes = (config: Config): string[] =>
+  effectiveScopes(config).filter((scope) => !OPTIONAL_SCOPES.includes(scope));

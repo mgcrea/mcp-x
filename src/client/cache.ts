@@ -7,6 +7,14 @@
 
 export type ResourceKind = "post" | "user" | "owned";
 
+/**
+ * What the cache is keyed by, which is wider than what X bills by. An Article
+ * is billed as the post that carries it, but it is cached apart from that post:
+ * a post shaped for x_get_post holds no body, and serving it to x_get_article
+ * would return an Article with nothing in it.
+ */
+export type CacheKind = ResourceKind | "article";
+
 export type CacheStats = {
   day: string;
   entries: number;
@@ -16,8 +24,8 @@ export type CacheStats = {
 };
 
 export type DayCache = {
-  get(kind: ResourceKind, id: string): unknown | undefined;
-  set(kind: ResourceKind, id: string, value: unknown): void;
+  get(kind: CacheKind, id: string): unknown | undefined;
+  set(kind: CacheKind, id: string, value: unknown): void;
   stats(): CacheStats;
 };
 
@@ -29,7 +37,7 @@ export type DayCache = {
  */
 export const utcDay = (now: number): string => new Date(now).toISOString().slice(0, 10);
 
-const keyOf = (kind: ResourceKind, id: string): string => `${kind}:${id}`;
+const keyOf = (kind: CacheKind, id: string): string => `${kind}:${id}`;
 
 export const createDayCache = (opts: {
   maxEntries: number;

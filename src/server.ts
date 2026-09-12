@@ -17,9 +17,9 @@ import { XApiClient } from "#/client/x";
 import { openInBrowser } from "#/compose/open";
 import {
   adsSetupInstructions,
-  effectiveScopes,
   hasAdsAccess,
   hasApiCredentials,
+  requiredScopes,
   setupInstructions,
   type Config,
 } from "#/config";
@@ -53,7 +53,9 @@ export const createServer = (opts: CreateServerOptions): CreatedServer => {
   const { config } = opts;
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 
-  const scopes = effectiveScopes(config);
+  // What a stored token must hold, which is less than what a login asks for:
+  // see OPTIONAL_SCOPES.
+  const scopes = requiredScopes(config);
   const store = createTokenStore(config.tokenFile, opts.logger);
 
   const tokenProvider =

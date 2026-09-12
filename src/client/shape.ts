@@ -138,6 +138,15 @@ const fullText = (raw: Rec): string => {
   return expandUrls(str(raw.text) ?? "", raw);
 };
 
+/** One line per media item: "photo: https://… (alt: …)". Shared by posts and Articles. */
+const describeMedia = (media: Rec): string => {
+  const type = str(media.type) ?? "media";
+  // Videos and GIFs carry `preview_image_url`; photos carry `url`.
+  const url = str(media.url) ?? str(media.preview_image_url);
+  const alt = str(media.alt_text);
+  return `${type}${url ? `: ${url}` : ""}${alt ? ` (alt: ${alt})` : ""}`;
+};
+
 const shapeMedia = (raw: Rec, index: Includes): string[] | undefined => {
   const attachments = isRecord(raw.attachments) ? raw.attachments : undefined;
   const keys = attachments && Array.isArray(attachments.media_keys) ? attachments.media_keys : [];
@@ -146,15 +155,7 @@ const shapeMedia = (raw: Rec, index: Includes): string[] | undefined => {
     const k = str(key);
     if (!k) continue;
     const media = index.media.get(k);
-    if (!media) {
-      items.push(`media (not expanded): ${k}`);
-      continue;
-    }
-    const type = str(media.type) ?? "media";
-    // Videos and GIFs carry `preview_image_url`; photos carry `url`.
-    const url = str(media.url) ?? str(media.preview_image_url);
-    const alt = str(media.alt_text);
-    items.push(`${type}${url ? `: ${url}` : ""}${alt ? ` (alt: ${alt})` : ""}`);
+    items.push(media ? describeMedia(media) : `media (not expanded): ${k}`);
   }
   return items.length > 0 ? items : undefined;
 };
@@ -194,6 +195,11 @@ export type ShapedPost = {
   reposts?: ShapedRef;
   media?: string[];
   conversation_id?: string;
+  /**
+   * Present when the post carries an X Article. Its `text` is then only a link,
+   * so the title is what says what it is; x_get_article reads the body.
+   */
+  article?: { title: string };
 };
 
 /**
@@ -235,6 +241,7 @@ export const shapePost = (raw: Rec, index: Includes): ShapedPost => {
   const media = shapeMedia(raw, index);
   const quotes = refOf("quoted");
   const repliesTo = refOf("replied_to");
+  const articleTitle = isRecord(raw.article) ? str(raw.article.title) : undefined;
 
   return {
     id,
@@ -249,6 +256,7 @@ export const shapePost = (raw: Rec, index: Includes): ShapedPost => {
     ...(reposts ? { reposts } : {}),
     ...(media ? { media } : {}),
     ...(str(raw.conversation_id) ? { conversation_id: str(raw.conversation_id) } : {}),
+    ...(articleTitle ? { article: { title: articleTitle } } : {}),
   };
 };
 
@@ -384,4 +392,116 @@ export const shapePaginatedPosts = (page: PostPage): ShapedPosts => {
     ...(page.nextToken ? { next_token: page.nextToken } : {}),
     ...(notFound ? { not_found: notFound } : {}),
   };
+};
+
+/** An Article as x_get_article serves it. `body` is the whole text; paging happens in the tool. */
+export type ShapedArticle = {
+  title: string;
+  body: string;
+  cover_image?: string;
+  images?: string[];
+  links?: string[];
+  embedded_posts?: string[];
+  mentions?: string[];
+  hashtags?: string[];
+  cashtags?: string[];
+};
+
+/** A post read for its Article. `article` is absent when the post is not one. */
+export type ArticleRead = {
+  post_id: string;
+  url: string;
+  author: string;
+  created_at?: string;
+  metrics?: ShapedPost["metrics"];
+  article?: ShapedArticle;
+};
+
+/** Distinct non-empty values in first-seen order, or undefined when there are none. */
+const distinct = (
+  items: unknown,
+  pick: (item: Rec) => string | undefined,
+): string[] | undefined => {
+  if (!Array.isArray(items)) return undefined;
+  const seen = new Set<string>();
+  for (const item of items) {
+    if (!isRecord(item)) continue;
+    const value = pick(item);
+    if (value) seen.add(value);
+  }
+  return seen.size > 0 ? [...seen] : undefined;
+};
+
+const prefixed = (prefix: string, value: string | undefined): string | undefined =>
+  value ? `${prefix}${value}` : undefined;
+
+/**
+ * Shape a post read with `tweet.fields=article` and the `article.cover_media` /
+ * `article.media_entities` expansions.
+ *
+ * X's Article object carries `plain_text`, the whole body — past 50,000
+ * characters is not unusual — beside a `preview_text` that is only its first
+ * ~200, which is why the preview is not returned. Its entity arrays are spans
+ * tagged with offsets into `plain_text`; someone reading the body needs the
+ * distinct values, not the positions, so that is what is kept. Media are keys
+ * into `includes.media`, resolved exactly like a post's attachments.
+ */
+export const shapeArticle = (raw: Rec, index: Includes): ArticleRead => {
+  const id = str(raw.id) ?? "";
+  const authorId = str(raw.author_id);
+  const metrics = shapeMetrics(raw);
+  const read: ArticleRead = {
+    post_id: id,
+    url: postUrl(authorId, id, index),
+    author: formatAuthor(authorId, index),
+    ...(str(raw.created_at) ? { created_at: str(raw.created_at) } : {}),
+    ...(metrics ? { metrics } : {}),
+  };
+
+  const article = isRecord(raw.article) ? raw.article : undefined;
+  const title = article ? str(article.title) : undefined;
+  if (!article || !title) return read;
+
+  const entities = isRecord(article.entities) ? article.entities : {};
+  const coverKey = str(article.cover_media);
+  const cover = coverKey ? index.media.get(coverKey) : undefined;
+  const coverImage = cover
+    ? (str(cover.url) ?? str(cover.preview_image_url))
+    : prefixed("media (not expanded): ", coverKey);
+  const keys = Array.isArray(article.media_entities) ? article.media_entities : [];
+  const images = keys
+    .map((key) => str(key))
+    .filter((key): key is string => key !== undefined)
+    .map((key) => {
+      const media = index.media.get(key);
+      return media ? describeMedia(media) : `media (not expanded): ${key}`;
+    });
+  const links = distinct(entities.urls, (u) => str(u.text) ?? str(u.expanded_url) ?? str(u.url));
+  const embedded = distinct(entities.tweets, (t) =>
+    prefixed("https://x.com/i/web/status/", str(t.id)),
+  );
+  const mentions = distinct(entities.mentions, (m) => prefixed("@", str(m.username)));
+  const hashtags = distinct(entities.hashtags, (h) => prefixed("#", str(h.text) ?? str(h.tag)));
+  const cashtags = distinct(entities.cashtags, (c) => prefixed("$", str(c.tag) ?? str(c.text)));
+
+  return {
+    ...read,
+    article: {
+      title,
+      body: str(article.plain_text) ?? "",
+      ...(coverImage ? { cover_image: coverImage } : {}),
+      ...(images.length > 0 ? { images } : {}),
+      ...(links ? { links } : {}),
+      ...(embedded ? { embedded_posts: embedded } : {}),
+      ...(mentions ? { mentions } : {}),
+      ...(hashtags ? { hashtags } : {}),
+      ...(cashtags ? { cashtags } : {}),
+    },
+  };
+};
+
+export const shapeArticlesResponse = (response: unknown): ArticleRead[] => {
+  const index = buildIncludesIndex(includesOf(response));
+  const data = isRecord(response) && Array.isArray(response.data) ? response.data : [];
+  return data.filter(isRecord).map((raw) => shapeArticle(raw, index));
 };

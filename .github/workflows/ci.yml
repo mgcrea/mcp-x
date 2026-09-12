@@ -114,17 +114,20 @@ jobs:
           x_get_auth_status
           x_login
           x_logout
+          x_validate_article
           x_validate_post'
           diff <(echo "$expected" | sed 's/^ *//') /tmp/phase1.txt \
             || { echo "phase 1: unconfigured server did not expose exactly the free tools"; exit 1; }
 
           list X_BEARER_TOKEN=ci-fake > /tmp/phase2.txt
           grep -qx 'x_get_post' /tmp/phase2.txt || { echo "phase 2: read tools missing"; exit 1; }
-          ! grep -q 'x_create_post\|x_delete_post' /tmp/phase2.txt || { echo "phase 2: paid writes leaked"; exit 1; }
+          grep -qx 'x_get_article' /tmp/phase2.txt || { echo "phase 2: article reads missing"; exit 1; }
+          ! grep -q 'x_create_post\|x_delete_post\|x_create_article_draft\|x_publish_article' /tmp/phase2.txt || { echo "phase 2: paid writes leaked"; exit 1; }
           ! grep -q 'x_ads_' /tmp/phase2.txt || { echo "phase 2: ads tools leaked"; exit 1; }
 
           list X_BEARER_TOKEN=ci-fake X_CLIENT_ID=ci X_ALLOW_WRITES=1 X_WRITE_BACKEND=api > /tmp/phase3.txt
           grep -qx 'x_create_post' /tmp/phase3.txt || { echo "phase 3: paid writes did not register"; exit 1; }
+          grep -qx 'x_create_article_draft' /tmp/phase3.txt || { echo "phase 3: article writes did not register"; exit 1; }
           grep -qx 'x_login' /tmp/phase3.txt || { echo "phase 3: login tool went missing with a client id configured"; exit 1; }
 
           # A contradiction between flags must degrade, never exit: this once
