@@ -72,12 +72,12 @@ describe("cursor pagination", () => {
   });
 });
 
-describe("error messages", () => {
-  const failing = (status: number, body: unknown, baseUrl?: string) =>
-    clientWith(vi.fn(async () => json(body, { status })) as unknown as typeof fetch, baseUrl).get(
-      "/12/accounts",
-    );
+const failing = (status: number, body: unknown, baseUrl?: string) =>
+  clientWith(vi.fn(async () => json(body, { status })) as unknown as typeof fetch, baseUrl).get(
+    "/12/accounts",
+  );
 
+describe("error messages", () => {
   it("reads the gateway's legacy numeric envelope and blames the token, not the scopes", async () => {
     await expect(
       failing(400, { errors: [{ message: "Bad Authentication data", code: 215 }] }),
@@ -194,10 +194,10 @@ describe("requests", () => {
   });
 });
 
-describe("analytics download", () => {
-  const gz = (body: unknown, headers: Record<string, string> = {}) =>
-    new Response(gzipSync(Buffer.from(JSON.stringify(body))), { status: 200, headers });
+const gz = (body: unknown, headers: Record<string, string> = {}) =>
+  new Response(gzipSync(Buffer.from(JSON.stringify(body))), { status: 200, headers });
 
+describe("analytics download", () => {
   it("decompresses a result file", async () => {
     const f = vi.fn(async () => gz({ data: [{ id: "abc" }] }));
     const out = await clientWith(f as unknown as typeof fetch).downloadGzipped(

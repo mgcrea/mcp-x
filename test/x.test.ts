@@ -189,14 +189,14 @@ describe("rate limit ledger", () => {
   });
 });
 
-describe("paginate", () => {
-  const page = (ids: string[], nextToken?: string) =>
-    json({
-      data: ids.map((id) => ({ id })),
-      includes: { users: [{ id: `u${ids[0]}` }] },
-      meta: nextToken ? { next_token: nextToken } : {},
-    });
+const page = (ids: string[], nextToken?: string) =>
+  json({
+    data: ids.map((id) => ({ id })),
+    includes: { users: [{ id: `u${ids[0]}` }] },
+    meta: nextToken ? { next_token: nextToken } : {},
+  });
 
+describe("paginate", () => {
   it("follows next_token via pagination_token and stops when it runs out", async () => {
     const f = vi
       .fn()

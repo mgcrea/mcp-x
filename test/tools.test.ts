@@ -45,7 +45,7 @@ const connect = async (
   return {
     client,
     fetchMock,
-    toolNames: async () => (await client.listTools()).tools.map((t) => t.name).sort(),
+    toolNames: async () => (await client.listTools()).tools.map((t) => t.name).toSorted(),
     call: async (name, args = {}) => {
       // A schema violation is rejected by the SDK at the protocol layer and
       // never reaches the tool body — which is the behaviour we want, so the
@@ -641,35 +641,36 @@ describe("x_get_auth_status", () => {
   });
 });
 
+/** Stage a logged-in OAuth session on disk, optionally without a recorded id. */
+const stageSession = (over: Record<string, unknown> = {}) => {
+  const dir = mkdtempSync(join(tmpdir(), "x-tools-"));
+  const tokenFile = join(dir, "tokens.json");
+  writeFileSync(
+    tokenFile,
+    JSON.stringify({
+      version: 1,
+      clientId: "cid",
+      scopes: ["tweet.read", "users.read", "bookmark.read", "offline.access"],
+      accessToken: "access-1",
+      refreshToken: "refresh-1",
+      expiresAt: Date.now() + 3_600_000,
+      obtainedAt: Date.now(),
+      username: "mgcrea",
+      ...over,
+    }),
+    { mode: 0o600 },
+  );
+  return { dir, tokenFile };
+};
+
+/** Credentials for a user-context login whose tokens live in `tokenFile`. */
+const userEnv = (tokenFile: string) => ({
+  X_BEARER_TOKEN: "t",
+  X_CLIENT_ID: "cid",
+  X_TOKEN_FILE: tokenFile,
+});
+
 describe("resolving your own user id", () => {
-  /** Stage a logged-in OAuth session on disk, optionally without a recorded id. */
-  const stageSession = (over: Record<string, unknown> = {}) => {
-    const dir = mkdtempSync(join(tmpdir(), "x-tools-"));
-    const tokenFile = join(dir, "tokens.json");
-    writeFileSync(
-      tokenFile,
-      JSON.stringify({
-        version: 1,
-        clientId: "cid",
-        scopes: ["tweet.read", "users.read", "bookmark.read", "offline.access"],
-        accessToken: "access-1",
-        refreshToken: "refresh-1",
-        expiresAt: Date.now() + 3_600_000,
-        obtainedAt: Date.now(),
-        username: "mgcrea",
-        ...over,
-      }),
-      { mode: 0o600 },
-    );
-    return { dir, tokenFile };
-  };
-
-  const env = (tokenFile: string) => ({
-    X_BEARER_TOKEN: "t",
-    X_CLIENT_ID: "cid",
-    X_TOKEN_FILE: tokenFile,
-  });
-
   // The dead end this replaced: login tolerates /2/users/me failing, so the id
   // can legitimately be absent — and telling the user to log in again would
   // just hit the same flaky endpoint.
@@ -681,7 +682,7 @@ describe("resolving your own user id", () => {
           ? jsonResponse({ data: { id: "44196397", username: "mgcrea" } })
           : jsonResponse({ data: [{ id: "1", text: "a bookmark" }] }),
       );
-      const h = await connect(env(tokenFile), fetchMock, { realAuth: true });
+      const h = await connect(userEnv(tokenFile), fetchMock, { realAuth: true });
       const res = await h.call("x_get_bookmarks", {});
 
       expect(res.isToolError).toBeFalsy();
@@ -701,7 +702,7 @@ describe("resolving your own user id", () => {
           ? jsonResponse({ data: { id: "44196397", username: "mgcrea" } })
           : jsonResponse({ data: [] }),
       );
-      const h = await connect(env(tokenFile), fetchMock, { realAuth: true });
+      const h = await connect(userEnv(tokenFile), fetchMock, { realAuth: true });
       await h.call("x_get_bookmarks", {});
       await h.call("x_get_bookmarks", {});
 
@@ -716,7 +717,7 @@ describe("resolving your own user id", () => {
     const { dir, tokenFile } = stageSession({ userId: "44196397" });
     try {
       const fetchMock = vi.fn(async () => jsonResponse({ data: [] }));
-      const h = await connect(env(tokenFile), fetchMock, { realAuth: true });
+      const h = await connect(userEnv(tokenFile), fetchMock, { realAuth: true });
       await h.call("x_get_home_timeline", {});
       expect(h.urls().some((u) => u.includes("/2/users/me"))).toBe(false);
       expect(h.urls()[0]).toContain("/2/users/44196397/timelines/reverse_chronological");
@@ -731,7 +732,7 @@ describe("resolving your own user id", () => {
   it("reports a staged session as signedIn, and x_logout with no arguments ends it", async () => {
     const { dir, tokenFile } = stageSession({ userId: "44196397" });
     try {
-      const h = await connect(env(tokenFile), vi.fn(), { realAuth: true });
+      const h = await connect(userEnv(tokenFile), vi.fn(), { realAuth: true });
       const before = await h.call("x_get_auth_status");
       expect(before.signedIn).toBe(true);
       expect(before.user.username).toBe("mgcrea");
@@ -754,7 +755,7 @@ describe("resolving your own user id", () => {
     const { dir, tokenFile } = stageSession();
     try {
       const fetchMock = vi.fn(async () => jsonResponse({ data: {} }));
-      const h = await connect(env(tokenFile), fetchMock, { realAuth: true });
+      const h = await connect(userEnv(tokenFile), fetchMock, { realAuth: true });
       const res = await h.call("x_get_bookmarks", {});
       expect(res.isToolError).toBe(true);
       expect(res.error).toMatch(/Pay-per-use.*Production|console\.x\.com/s);
@@ -920,9 +921,9 @@ describe("ads tool registration", () => {
   });
 });
 
-describe("ads money handling", () => {
-  const adsResponse = (data: unknown) => jsonResponse({ data, request: { params: {} } });
+const adsResponse = (data: unknown) => jsonResponse({ data, request: { params: {} } });
 
+describe("ads money handling", () => {
   it("multiplies a major-unit budget into X's micros, and creates PAUSED", async () => {
     const fetchMock = vi.fn(async () => adsResponse({ id: "8v7jo", name: "Q3" }));
     const h = await connect(ADS_WRITE, fetchMock);
@@ -1119,13 +1120,13 @@ describe("ads analytics guards", () => {
   });
 });
 
-describe("x_request", () => {
-  const methodsOf = async (h: Harness): Promise<string[]> => {
-    const tool = (await h.client.listTools()).tools.find((t) => t.name === "x_request");
-    const schema = tool?.inputSchema as unknown as { properties: { method: { enum: string[] } } };
-    return schema.properties.method.enum;
-  };
+const methodsOf = async (h: Harness): Promise<string[]> => {
+  const tool = (await h.client.listTools()).tools.find((t) => t.name === "x_request");
+  const schema = tool?.inputSchema as unknown as { properties: { method: { enum: string[] } } };
+  return schema.properties.method.enum;
+};
 
+describe("x_request", () => {
   it("is not registered without credentials", async () => {
     const names = await (await connect({}, undefined, { realAuth: true })).toolNames();
     expect(names).not.toContain("x_request");

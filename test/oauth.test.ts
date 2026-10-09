@@ -143,21 +143,21 @@ describe("tokensAreStale", () => {
   });
 });
 
-describe("userTokenProvider refresh rotation", () => {
-  const makeProvider = (oauth: OAuthClient, tokens = storedTokens()) => {
-    const store = createTokenStore(tokenPath);
-    store.write(tokens as never);
-    return {
+const makeProvider = (oauth: OAuthClient, tokens = storedTokens()) => {
+  const store = createTokenStore(tokenPath);
+  store.write(tokens as never);
+  return {
+    store,
+    provider: userTokenProvider({
       store,
-      provider: userTokenProvider({
-        store,
-        oauth,
-        clientId: "cid",
-        requiredScopes: ["tweet.read"],
-      }),
-    };
+      oauth,
+      clientId: "cid",
+      requiredScopes: ["tweet.read"],
+    }),
   };
+};
 
+describe("userTokenProvider refresh rotation", () => {
   it("returns the cached token while it is still valid", async () => {
     const oauth = { exchangeCode: vi.fn(), refresh: vi.fn() } as unknown as OAuthClient;
     const { provider } = makeProvider(oauth);
@@ -234,7 +234,8 @@ describe("userTokenProvider refresh rotation", () => {
   });
 
   it("issues exactly one refresh for concurrent callers", async () => {
-    let resolveRefresh: (v: unknown) => void = () => {};
+    // Assigned by the refresh below before anything calls it.
+    let resolveRefresh!: (v: unknown) => void;
     const refresh = vi.fn(
       () =>
         new Promise((resolve) => {
@@ -345,6 +346,19 @@ describe("toStoredTokens", () => {
   });
 });
 
+// Drive the callback the way a browser would, once the URL is known.
+const openBrowser = async (authorizeUrl: string) => {
+  const state = new URL(authorizeUrl).searchParams.get("state");
+  await fetch(`http://127.0.0.1:8799/callback?code=the-code&state=${state}`);
+  return { opened: true };
+};
+
+/** A "browser" whose callback carries a state the login flow never issued. */
+const openBrowserForgedState = async () => {
+  await fetch("http://127.0.0.1:8798/callback?code=c&state=forged");
+  return { opened: true };
+};
+
 describe("startLoginFlow", () => {
   it("refuses without a client id, naming the callback URL to register", async () => {
     const config = loadConfig({ X_BEARER_TOKEN: "t" }, ABSENT);
@@ -378,13 +392,6 @@ describe("startLoginFlow", () => {
       return new Response(JSON.stringify({ data: { id: "44196397", username: "mgcrea" } }));
     });
 
-    // Drive the callback the way a browser would, once the URL is known.
-    const openBrowser = async (authorizeUrl: string) => {
-      const state = new URL(authorizeUrl).searchParams.get("state");
-      await fetch(`http://127.0.0.1:8799/callback?code=the-code&state=${state}`);
-      return { opened: true };
-    };
-
     const { tokens } = await startLoginFlow({
       config,
       store,
@@ -409,16 +416,12 @@ describe("startLoginFlow", () => {
       },
       ABSENT,
     );
-    const openBrowser = async () => {
-      await fetch("http://127.0.0.1:8798/callback?code=c&state=forged");
-      return { opened: true };
-    };
     await expect(
       startLoginFlow({
         config,
         store: createTokenStore(tokenPath),
         fetch: vi.fn() as unknown as typeof fetch,
-        openBrowser,
+        openBrowser: openBrowserForgedState,
         timeoutMs: 5000,
       }),
     ).rejects.toThrow(/state mismatch/);
